@@ -1,0 +1,15 @@
+[package]
+name = "crossbeam-queue"
+version = "0.1.0"
+authors = ["The Crossbeam Project Developers"]
+license = "MIT/Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/crossbeam-rs/crossbeam-queue"
+homepage = "https://github.com/crossbeam-rs/crossbeam-queue"
+documentation = "https://docs.rs/crossbeam-queue"
+description = "A Wait-free Queue as Fast as Fetch-and-Add"
+
+[dependencies]
+crossbeam-epoch = { git = "https://github.com/jeehoonkang/crossbeam-epoch.git", branch="qsbr" }
+crossbeam-utils = "0.1"
+arrayvec = "0.4"
