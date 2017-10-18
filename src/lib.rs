@@ -3,7 +3,6 @@
 
 extern crate crossbeam_epoch as epoch;
 extern crate crossbeam_utils;
-extern crate arrayvec;
 
 pub mod list;
 pub mod helpers;

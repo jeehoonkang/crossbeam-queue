@@ -1,22 +1,18 @@
+use std::fmt;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering;
-use arrayvec::ArrayVec;
 use epoch::{Atomic, Ptr, Owned, Scope};
 
-use list;
 use helpers;
 
 const SEGMENT_SIZE: usize = 64;
 
+#[derive(Debug, Default)]
 struct State(AtomicUsize);
 
 impl State {
-    pub fn new() -> Self {
-        Self { 0: ATOMIC_USIZE_INIT }
-    }
-
     fn encode(data: usize, bit: bool) -> usize {
         (data << 1) + (if bit { 1 } else { 0 })
     }
@@ -57,6 +53,7 @@ impl State {
     }
 }
 
+#[derive(Debug)]
 struct PushReq<T: Send> {
     val: Atomic<T>,
     state: State,
@@ -64,81 +61,109 @@ struct PushReq<T: Send> {
 
 unsafe impl<T: Send> Sync for PushReq<T> {}
 
+#[derive(Debug, Default)]
 struct PopReq {
     id: AtomicUsize,
     state: State,
 }
 
+unsafe impl Sync for PopReq {}
+
+#[derive(Debug)]
+struct Registry<T: Send> {
+    push_req: PushReq<T>,
+    pop_req: PopReq,
+    lower_bound: AtomicUsize,
+}
+
+#[derive(Debug)]
 struct Cell<T: Send> {
     val: Atomic<T>,
     push: Atomic<PushReq<T>>,
     pop: Atomic<PopReq>,
 }
 
+impl<T: Send> Default for Cell<T> {
+    fn default() -> Self {
+        Self {
+            val: Atomic::null(),
+            push: Atomic::null(),
+            pop: Atomic::null(),
+        }
+    }
+}
+
 struct Segment<T: Send> {
     id: usize,
-    cells: ArrayVec<[Cell<T>; SEGMENT_SIZE]>,
-}
-
-struct Global<T: Send> {
-    segments: list::List<Segment<T>>, // FIXME: maybe we don't need it..
-    head: AtomicUsize,
-    tail: AtomicUsize,
-    push_reqs: helpers::Tracker<PushReq<T>>,
-    pop_reqs: helpers::Tracker<PopReq>,
-}
-
-pub struct Queue<T: Send>(Arc<Global<T>>);
-
-pub struct Handle<T: Send> {
-    global: Arc<Global<T>>,
-    head: Atomic<list::Node<Segment<T>>>,
-    tail: Atomic<list::Node<Segment<T>>>,
-    push_req: helpers::Handle<PushReq<T>>,
-    pop_req: helpers::Handle<PopReq>,
-}
-
-impl<T: Send> PushReq<T> {
-    fn new() -> Self {
-        PushReq {
-            val: Atomic::null(),
-            state: State::new(),
-        }
-    }
-}
-
-impl PopReq {
-    fn new() -> Self {
-        PopReq {
-            id: ATOMIC_USIZE_INIT,
-            state: State::new(),
-        }
-    }
-}
-
-impl<T: Send> Cell<T> {
-    fn new() -> Self {
-        unsafe { mem::uninitialized() }
-    }
+    cells: [Cell<T>; SEGMENT_SIZE],
+    next: Atomic<Segment<T>>,
 }
 
 impl<T: Send> Segment<T> {
     fn new(id: usize) -> Self {
-        Segment {
+        let mut result = Self {
             id: id,
-            cells: ArrayVec::new(),
+            cells: unsafe { mem::uninitialized() },
+            next: Atomic::null(),
+        };
+        for i in 0..SEGMENT_SIZE {
+            result.cells[i] = Cell::default();
+        }
+        result
+    }
+}
+
+impl<T: Send> fmt::Debug for Segment<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Segment {{ id: {} }}", self.id)
+    }
+}
+
+#[derive(Debug)]
+struct Global<T: Send> {
+    segments: Atomic<Segment<T>>,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    registries: helpers::Tracker<Registry<T>>,
+}
+
+#[derive(Debug)]
+pub struct Queue<T: Send>(Arc<Global<T>>);
+
+#[derive(Debug)]
+pub struct Handle<T: Send> {
+    global: Arc<Global<T>>,
+    head: Atomic<Segment<T>>,
+    tail: Atomic<Segment<T>>,
+    registry: helpers::Handle<Registry<T>>,
+}
+
+impl<T: Send> Default for PushReq<T> {
+    fn default() -> Self {
+        Self {
+            val: Atomic::null(),
+            state: State::default(),
+        }
+    }
+}
+
+impl<T: Send> Default for Registry<T> {
+    fn default() -> Self {
+        Self {
+            push_req: PushReq::default(),
+            pop_req: PopReq::default(),
+            lower_bound: ATOMIC_USIZE_INIT,
         }
     }
 }
 
 impl<T: Send> Global<T> {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
-            segments: list::List::new(),
+            segments: Atomic::new(Segment::new(0)),
             head: ATOMIC_USIZE_INIT,
             tail: ATOMIC_USIZE_INIT,
-            push_reqs: helpers::Tracker::new(),
-            pop_reqs: helpers::Tracker::new(),
+            registries: helpers::Tracker::new(),
         }
     }
 }
@@ -153,8 +178,7 @@ impl<T: Send> Queue<T> {
             global: self.0.clone(),
             head: Atomic::null(),
             tail: Atomic::null(),
-            push_req: self.0.push_reqs.handle(PushReq::new()),
-            pop_req: self.0.pop_reqs.handle(PopReq::new()),
+            registry: self.0.registries.handle(Registry::default()),
         }
     }
 }
@@ -163,34 +187,79 @@ impl<T: Send> Handle<T> {
     const PATIENCE: usize = 10;
 
     #[inline]
-    #[allow(unused_variables)]
+    fn normalize(&self, scope: &Scope) {
+        let segments = self.global.segments.load(Ordering::Relaxed, scope);
+        let segments_ref = unsafe { segments.as_ref().unwrap() };
+
+        let tail = self.tail.load(Ordering::Relaxed, scope);
+        let tail_ref = unsafe { tail.as_ref() };
+
+        match tail_ref {
+            None => {
+                self.tail.store(segments, Ordering::Relaxed);
+            }
+            Some(tail_ref) => {
+                if tail_ref.id < segments_ref.id {
+                    self.tail.store(segments, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let head = self.head.load(Ordering::Relaxed, scope);
+        let head_ref = unsafe { head.as_ref() };
+
+        match head_ref {
+            None => {
+                self.head.store(segments, Ordering::Relaxed);
+            }
+            Some(head_ref) => {
+                if head_ref.id < segments_ref.id {
+                    self.head.store(segments, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    #[inline]
     fn find_cell<'scope>(
         &'scope self,
-        segment: &'scope Atomic<list::Node<Segment<T>>>,
+        segments: &'scope Atomic<Segment<T>>,
         cell_id: usize,
         scope: &'scope Scope,
-    ) -> Ptr<'scope, Cell<T>> {
+    ) -> &'scope Cell<T> {
         let segment_id = cell_id / SEGMENT_SIZE;
 
-        let mut s = segment.load(Ordering::Relaxed, scope);
+        let mut s = segments.load(Ordering::Relaxed, scope);
         let mut s_ref = unsafe { s.as_ref().unwrap() };
-        for _ in 0..(segment_id - s_ref.get_data().id) {
-            let next = s_ref.get_next().load(Ordering::Relaxed, scope);
+        for id in 0..(segment_id - s_ref.id) {
+            let next = s_ref.next.load(Ordering::Relaxed, scope);
             match unsafe { next.as_ref() } {
                 Some(next_ref) => {
                     s = next;
                     s_ref = next_ref;
                 }
                 None => {
-                    unimplemented!();
+                    let segment = Owned::new(Segment::new(id + 1));
+                    let _ = s_ref
+                        .next
+                        .compare_and_set_owned(Ptr::null(), segment, Ordering::Relaxed, scope)
+                        .map(|next| {
+                            s = next;
+                            s_ref = unsafe { next.as_ref().unwrap() };
+                        })
+                        .map_err(|(next, _)| {
+                            s = next;
+                            s_ref = unsafe { next.as_ref().unwrap() };
+                        });
                 }
             }
         }
 
-        segment.store(s, Ordering::Relaxed);
-        Ptr::from_raw(&s_ref.get_data().cells[cell_id % SEGMENT_SIZE] as *const _)
+        segments.store(s, Ordering::Relaxed);
+        &s_ref.cells[cell_id % SEGMENT_SIZE]
     }
 
+    #[inline]
     fn advance_end_for_linearizability(end: &AtomicUsize, cell_id: usize) {
         let mut e = end.load(Ordering::Relaxed);
         loop {
@@ -211,6 +280,7 @@ impl<T: Send> Handle<T> {
         cell_id: usize,
         i: usize,
     ) -> Result<(), (usize, bool)> {
+        // This should be a strong update.
         state.compare_exchange(
             cell_id,
             true,
@@ -219,22 +289,6 @@ impl<T: Send> Handle<T> {
             Ordering::Relaxed,
             Ordering::Relaxed,
         )
-    }
-
-    pub fn push(&self, val: T, scope: &Scope) {
-        let mut val = Owned::new(val);
-        let mut cell_id = 0;
-        for _ in 0..Self::PATIENCE {
-            match self.push_fast(val, scope) {
-                Ok(_) => return,
-                Err((v, id)) => {
-                    val = v;
-                    cell_id = id;
-                }
-            }
-        }
-
-        self.push_slow(val, cell_id, scope);
     }
 
     #[inline]
@@ -247,23 +301,19 @@ impl<T: Send> Handle<T> {
     fn push_fast(&self, val: Owned<T>, scope: &Scope) -> Result<(), (Owned<T>, usize)> {
         let i = self.global.tail.fetch_add(1, Ordering::Relaxed);
         let c = self.find_cell(&self.tail, i, scope);
-        unsafe {
-            c.as_ref()
-                .unwrap()
-                .val
-                .compare_and_set_owned(Ptr::null(), val, Ordering::Relaxed, scope)
-                .map(|_| ())
-                .map_err(|(_, val)| (val, i))
-        }
+        c.val
+            .compare_and_set_owned(Ptr::null(), val, Ordering::Relaxed, scope)
+            .map(|_| ())
+            .map_err(|(_, val)| (val, i))
     }
 
     #[cold]
     #[inline]
     fn push_slow(&self, val: Owned<T>, mut cell_id: usize, scope: &Scope) {
-        let req = self.push_req.get();
+        let req = &self.registry.get().push_req;
         let val = val.into_ptr(scope);
         req.val.store(val, Ordering::Relaxed);
-        req.state.store(cell_id, true, Ordering::Release);
+        req.state.store(cell_id, true, Ordering::Relaxed);
 
         let tail = self.tail.load(Ordering::Relaxed, scope);
         let original_tail = Atomic::null();
@@ -272,7 +322,6 @@ impl<T: Send> Handle<T> {
         loop {
             let i = self.global.tail.fetch_add(1, Ordering::Relaxed);
             let c = self.find_cell(&original_tail, i, scope);
-            let c = unsafe { c.as_ref().unwrap() };
             if c.push
                 .compare_and_set(
                     Ptr::null(),
@@ -294,7 +343,59 @@ impl<T: Send> Handle<T> {
         }
 
         let c = self.find_cell(&self.tail, cell_id, scope);
-        let c = unsafe { c.as_ref().unwrap() };
         self.push_commit(c, val, cell_id);
+    }
+
+    pub fn push(&self, val: T, scope: &Scope) {
+        self.normalize(scope);
+
+        let mut val = Owned::new(val);
+        let mut cell_id = 0;
+        for _ in 0..Self::PATIENCE {
+            match self.push_fast(val, scope) {
+                Ok(_) => return,
+                Err((v, id)) => {
+                    val = v;
+                    cell_id = id;
+                }
+            }
+        }
+
+        self.push_slow(val, cell_id, scope);
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use crossbeam_utils::scoped;
+    use epoch::Collector;
+    use super::Queue;
+
+    const THREADS: usize = 8;
+    const COUNT: usize = 1000;
+
+    #[test]
+    fn test_push() {
+        let collector = Collector::new();
+        let queue = Queue::new();
+
+        let threads = (0..THREADS)
+            .map(|_| {
+                scoped::scope(|scope| {
+                    scope.spawn(|| {
+                        let handle = collector.handle();
+                        let queue = queue.handle();
+                        for _ in 0..COUNT {
+                            handle.pin(|scope| { queue.push(42, scope); });
+                        }
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for t in threads {
+            t.join();
+        }
     }
 }
