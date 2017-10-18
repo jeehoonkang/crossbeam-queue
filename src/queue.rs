@@ -185,6 +185,8 @@ impl<T: Send> Queue<T> {
 
 impl<T: Send> Handle<T> {
     const PATIENCE: usize = 10;
+    const TAG_EMPTY: usize = 1;
+    const TAG_INVALID: usize = 2;
 
     #[inline]
     fn normalize(&self, scope: &Scope) {
@@ -300,8 +302,8 @@ impl<T: Send> Handle<T> {
     #[inline]
     fn push_fast(&self, val: Owned<T>, scope: &Scope) -> Result<(), (Owned<T>, usize)> {
         let i = self.global.tail.fetch_add(1, Ordering::Relaxed);
-        let c = self.find_cell(&self.tail, i, scope);
-        c.val
+        let cell = self.find_cell(&self.tail, i, scope);
+        cell.val
             .compare_and_set_owned(Ptr::null(), val, Ordering::Relaxed, scope)
             .map(|_| ())
             .map_err(|(_, val)| (val, i))
@@ -321,15 +323,15 @@ impl<T: Send> Handle<T> {
 
         loop {
             let i = self.global.tail.fetch_add(1, Ordering::Relaxed);
-            let c = self.find_cell(&original_tail, i, scope);
-            if c.push
+            let cell = self.find_cell(&original_tail, i, scope);
+            if cell.push
                 .compare_and_set(
                     Ptr::null(),
                     Ptr::from_raw(req as *const _),
                     Ordering::Relaxed,
                     scope,
                 )
-                .is_ok() && c.val.load(Ordering::Relaxed, scope).is_null()
+                .is_ok() && cell.val.load(Ordering::Relaxed, scope).is_null()
             {
                 let _ = self.try_to_claim_req(&req.state, cell_id, i);
                 break;
@@ -342,8 +344,8 @@ impl<T: Send> Handle<T> {
             }
         }
 
-        let c = self.find_cell(&self.tail, cell_id, scope);
-        self.push_commit(c, val, cell_id);
+        let cell = self.find_cell(&self.tail, cell_id, scope);
+        self.push_commit(cell, val, cell_id);
     }
 
     pub fn push(&self, val: T, scope: &Scope) {
@@ -362,6 +364,73 @@ impl<T: Send> Handle<T> {
         }
 
         self.push_slow(val, cell_id, scope);
+    }
+
+    pub fn try_pop(&self, scope: &Scope) -> Option<T> {
+        self.normalize(scope);
+
+        let mut cell_id = 0;
+        let result = self.try_pop_fast(&mut cell_id, scope)
+            .or_else(|| self.try_pop_slow(cell_id, scope));
+        if result.is_some() {
+            self.help_pop(scope);
+        }
+        result
+    }
+
+    #[inline]
+    fn try_pop_fast<'scope>(&'scope self, id: &'scope mut usize, scope: &'scope Scope) -> Option<T> {
+        for _ in 0..Self::PATIENCE {
+            let i = self.global.head.fetch_add(1, Ordering::Relaxed);
+            let cell = self.find_cell(&self.head, i, scope);
+            let result = self.help_push(cell, i, scope);
+
+            match result.tag() {
+                Self::TAG_EMPTY => return None,
+                Self::TAG_INVALID => *id = i,
+                _ => {
+                    if cell.pop
+                        .compare_and_set(
+                            Ptr::null(),
+                            Ptr::null().with_tag(Self::TAG_INVALID),
+                            Ordering::Relaxed,
+                            scope,
+                        )
+                        .is_ok()
+                    {
+                        return Some(unsafe { result.into_owned().into_inner() });
+                    } else {
+                        *id = i;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn try_pop_slow(&self, cell_id: usize, scope: &Scope) -> Option<T> {
+        let req = &self.registry.get().pop_req;
+        req.id.store(cell_id, Ordering::Relaxed);
+        req.state.store(cell_id, true, Ordering::Relaxed);
+
+        self.help_pop(scope);
+
+        let i = req.state.load(Ordering::Relaxed).0;
+        let cell = self.find_cell(&self.head, i, scope);
+        Self::advance_end_for_linearizability(&self.global.head, cell_id + 1);
+
+        let result = cell.val.load(Ordering::Relaxed, scope);
+        unsafe { result.as_ref().map(|_| result.into_owned().into_inner()) }
+    }
+
+    fn help_push<'scope>(&'scope self, cell: &'scope Cell<T>, i: usize, scope: &'scope Scope) -> Ptr<'scope, T> {
+        unimplemented!()
+    }
+
+    #[inline]
+    fn help_pop(&self, scope: &Scope) {
+        unimplemented!()
     }
 }
 
