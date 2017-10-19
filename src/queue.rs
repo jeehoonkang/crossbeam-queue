@@ -375,11 +375,11 @@ impl<T: Send> Handle<T> {
         if result.is_some() {
             self.help_pop(scope);
         }
-        result
+        result.map(|result| result.into_inner())
     }
 
     #[inline]
-    fn try_pop_fast<'scope>(&'scope self, id: &'scope mut usize, scope: &'scope Scope) -> Option<T> {
+    fn try_pop_fast<'scope>(&'scope self, id: &'scope mut usize, scope: &'scope Scope) -> Option<Owned<T>> {
         for _ in 0..Self::PATIENCE {
             let i = self.global.head.fetch_add(1, Ordering::Relaxed);
             let cell = self.find_cell(&self.head, i, scope);
@@ -398,7 +398,7 @@ impl<T: Send> Handle<T> {
                         )
                         .is_ok()
                     {
-                        return Some(unsafe { result.into_owned().into_inner() });
+                        return Some(unsafe { result.into_owned() });
                     } else {
                         *id = i;
                     }
@@ -409,7 +409,7 @@ impl<T: Send> Handle<T> {
     }
 
     #[inline]
-    fn try_pop_slow(&self, cell_id: usize, scope: &Scope) -> Option<T> {
+    fn try_pop_slow(&self, cell_id: usize, scope: &Scope) -> Option<Owned<T>> {
         let req = &self.registry.get().pop_req;
         req.id.store(cell_id, Ordering::Relaxed);
         req.state.store(cell_id, true, Ordering::Relaxed);
@@ -421,11 +421,51 @@ impl<T: Send> Handle<T> {
         Self::advance_end_for_linearizability(&self.global.head, cell_id + 1);
 
         let result = cell.val.load(Ordering::Relaxed, scope);
-        unsafe { result.as_ref().map(|_| result.into_owned().into_inner()) }
+        unsafe { result.as_ref().map(|_| result.into_owned()) }
     }
 
     fn help_push<'scope>(&'scope self, cell: &'scope Cell<T>, i: usize, scope: &'scope Scope) -> Ptr<'scope, T> {
-        unimplemented!()
+        let val = match cell.val.compare_and_set(
+            Ptr::null(),
+            Ptr::null().with_tag(Self::TAG_INVALID),
+            Ordering::Relaxed,
+            scope,
+        ) {
+            Ok(_) => Ptr::null().with_tag(Self::TAG_INVALID),
+            Err(val) => {
+                if val != Ptr::null().with_tag(Self::TAG_INVALID) {
+                    return val;
+                }
+                val
+            }
+        };
+
+        let req = cell.push.load(Ordering::Relaxed, scope);
+
+        if req == Ptr::null() {
+            unimplemented!();
+        }
+
+        if req.tag() == Self::TAG_INVALID {
+            let tail = self.global.tail.load(Ordering::Relaxed);
+            return Ptr::null().with_tag(if tail <= i { Self::TAG_EMPTY } else { Self::TAG_INVALID });
+        }
+
+        let req_ref = unsafe { req.as_ref().unwrap() };
+        let (id, pending) = req_ref.state.load(Ordering::Relaxed);
+        let v = req_ref.val.load(Ordering::Relaxed, scope);
+
+        if id > i {
+            if val.tag() == Self::TAG_INVALID && self.global.tail.load(Ordering::Relaxed) <= i {
+                return Ptr::null().with_tag(Self::TAG_EMPTY);
+            }
+        } else {
+            if self.try_to_claim_req(&req_ref.state, id, i).is_ok() ||
+                ((id, pending) == (i, false) && val.tag() == Self::TAG_INVALID) {
+                self.push_commit(cell, v, i);
+            }
+        }
+        val
     }
 
     #[inline]
