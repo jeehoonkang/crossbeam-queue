@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use epoch::{Atomic, Owned, Ptr, Scope, unprotected};
+use epoch::{Atomic, Owned, Shared, Guard, unprotected};
 use crossbeam_utils::cache_padded::CachePadded;
 
 
@@ -29,15 +29,15 @@ pub struct List<T> {
     head: Atomic<Node<T>>,
 }
 
-pub struct Iter<'scope, T: 'scope> {
-    /// The scope in which the iterator is operating.
-    scope: &'scope Scope,
+pub struct Iter<'g, T: 'g> {
+    /// The guard in which the iterator is operating.
+    guard: &'g Guard,
 
     /// Pointer from the predecessor to the current entry.
-    pred: &'scope Atomic<Node<T>>,
+    pred: &'g Atomic<Node<T>>,
 
     /// The current entry.
-    curr: Ptr<'scope, Node<T>>,
+    curr: Shared<'g, Node<T>>,
 }
 
 #[derive(PartialEq, Debug)]
@@ -64,8 +64,8 @@ impl<T> Node<T> {
     }
 
     /// Marks this entry as deleted.
-    pub fn delete(&self, scope: &Scope) {
-        self.0.next.fetch_or(1, Release, scope);
+    pub fn delete(&self, guard: &Guard) {
+        self.0.next.fetch_or(1, Release, guard);
     }
 }
 
@@ -76,23 +76,23 @@ impl<T> List<T> {
     }
 
     #[inline]
-    pub fn get_head<'scope>(&'scope self, scope: &'scope Scope) -> Ptr<'scope, Node<T>> {
-        self.head.load(Relaxed, scope)
+    pub fn get_head<'g>(&'g self, guard: &'g Guard) -> Shared<'g, Node<T>> {
+        self.head.load(Relaxed, guard)
     }
 
     /// Inserts `data` into the list.
     #[inline]
-    fn insert_internal<'scope>(
-        to: &'scope Atomic<Node<T>>,
+    fn insert_internal<'g>(
+        to: &'g Atomic<Node<T>>,
         data: T,
-        scope: &'scope Scope,
-    ) -> Ptr<'scope, Node<T>> {
+        guard: &'g Guard,
+    ) -> Shared<'g, Node<T>> {
         let mut cur = Owned::new(Node::new(data));
-        let mut next = to.load(Relaxed, scope);
+        let mut next = to.load(Relaxed, guard);
 
         loop {
             cur.0.next.store(next, Relaxed);
-            match to.compare_and_set_weak_owned(next, cur, Release, scope) {
+            match to.compare_and_set_weak(next, cur, Release, guard) {
                 Ok(cur) => return cur,
                 Err((n, c)) => {
                     next = n;
@@ -104,20 +104,20 @@ impl<T> List<T> {
 
     /// Inserts `data` into the head of the list.
     #[inline]
-    pub fn insert<'scope>(&'scope self, data: T, scope: &'scope Scope) -> Ptr<'scope, Node<T>> {
-        Self::insert_internal(&self.head, data, scope)
+    pub fn insert<'g>(&'g self, data: T, guard: &'g Guard) -> Shared<'g, Node<T>> {
+        Self::insert_internal(&self.head, data, guard)
     }
 
     /// Inserts `data` after `after` into the list.
     #[inline]
     #[allow(dead_code)]
-    pub fn insert_after<'scope>(
-        &'scope self,
-        after: &'scope Atomic<Node<T>>,
+    pub fn insert_after<'g>(
+        &'g self,
+        after: &'g Atomic<Node<T>>,
         data: T,
-        scope: &'scope Scope,
-    ) -> Ptr<'scope, Node<T>> {
-        Self::insert_internal(after, data, scope)
+        guard: &'g Guard,
+    ) -> Shared<'g, Node<T>> {
+        Self::insert_internal(after, data, guard)
     }
 
     /// Returns an iterator over all data.
@@ -131,34 +131,33 @@ impl<T> List<T> {
     /// 1. If a new datum is inserted during iteration, it may or may not be returned.
     /// 2. If a datum is deleted during iteration, it may or may not be returned.
     /// 3. It may not return all data if a concurrent thread continues to iterate the same list.
-    pub fn iter<'scope>(&'scope self, scope: &'scope Scope) -> Iter<'scope, T> {
+    pub fn iter<'g>(&'g self, guard: &'g Guard) -> Iter<'g, T> {
         let pred = &self.head;
-        let curr = pred.load(Acquire, scope);
-        Iter { scope, pred, curr }
+        let curr = pred.load(Acquire, guard);
+        Iter { guard, pred, curr }
     }
 }
 
 impl<T> Drop for List<T> {
     fn drop(&mut self) {
         unsafe {
-            unprotected(|scope| {
-                let mut curr = self.head.load(Relaxed, scope);
-                while let Some(c) = curr.as_ref() {
-                    let succ = c.0.next.load(Relaxed, scope);
-                    drop(curr.into_owned());
-                    curr = succ;
-                }
-            });
+            let guard = unprotected();
+            let mut curr = self.head.load(Relaxed, guard);
+            while let Some(c) = curr.as_ref() {
+                let succ = c.0.next.load(Relaxed, guard);
+                drop(curr.into());
+                curr = succ;
+            }
         }
     }
 }
 
-impl<'scope, T> Iterator for Iter<'scope, T> {
-    type Item = Result<&'scope Node<T>, IterError>;
+impl<'g, T> Iterator for Iter<'g, T> {
+    type Item = Result<&'g Node<T>, IterError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(c) = unsafe { self.curr.as_ref() } {
-            let succ = c.0.next.load(Acquire, self.scope);
+            let succ = c.0.next.load(Acquire, self.guard);
 
             if succ.tag() == 1 {
                 // This entry was removed. Try unlinking it from the list.
@@ -168,18 +167,18 @@ impl<'scope, T> Iterator for Iter<'scope, T> {
                     self.curr,
                     succ,
                     Acquire,
-                    self.scope,
+                    self.guard,
                 ) {
                     Ok(_) => {
                         unsafe {
                             // Deferred drop of `T` is scheduled here.
                             // This is okay because `.delete()` can be called only if `T: 'static`.
                             let p = self.curr;
-                            self.scope.defer(move || p.into_owned());
+                            self.guard.defer(move || p.into());
                         }
                         self.curr = succ;
                     }
-                    Err(succ) => {
+                    Err((succ, _)) => {
                         // We lost the race to delete the entry by a concurrent iterator. Set
                         // `self.curr` to the updated pointer, and report the lost.
                         self.curr = succ;
@@ -220,21 +219,21 @@ mod tests {
         let collector = Collector::new();
         let handle = collector.handle();
 
-        handle.pin(|scope| {
-            let p2 = l.insert(2, scope);
+        handle.pin(|guard| {
+            let p2 = l.insert(2, guard);
             let n2 = unsafe { p2.as_ref().unwrap() };
-            let _p3 = l.insert_after(&n2.0.next, 3, scope);
-            let _p1 = l.insert(1, scope);
+            let _p3 = l.insert_after(&n2.0.next, 3, guard);
+            let _p1 = l.insert(1, guard);
 
-            let mut iter = l.iter(scope);
+            let mut iter = l.iter(guard);
             assert!(iter.next().is_some());
             assert!(iter.next().is_some());
             assert!(iter.next().is_some());
             assert!(iter.next().is_none());
 
-            n2.delete(scope);
+            n2.delete(guard);
 
-            let mut iter = l.iter(scope);
+            let mut iter = l.iter(guard);
             assert!(iter.next().is_some());
             assert!(iter.next().is_some());
             assert!(iter.next().is_none());

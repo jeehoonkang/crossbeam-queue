@@ -3,7 +3,7 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering;
-use epoch::{Atomic, Ptr, Owned, Scope};
+use epoch::{Atomic, Owned, Shared, Guard};
 
 use helpers;
 
@@ -71,8 +71,8 @@ unsafe impl Sync for PopReq {}
 
 #[derive(Debug)]
 struct Registry<T: Send> {
-    push_req: PushReq<T>,
-    pop_req: PopReq,
+    push: PushReq<T>,
+    pop: PopReq,
     lower_bound: AtomicUsize,
 }
 
@@ -150,8 +150,8 @@ impl<T: Send> Default for PushReq<T> {
 impl<T: Send> Default for Registry<T> {
     fn default() -> Self {
         Self {
-            push_req: PushReq::default(),
-            pop_req: PopReq::default(),
+            push: PushReq::default(),
+            pop: PopReq::default(),
             lower_bound: ATOMIC_USIZE_INIT,
         }
     }
@@ -189,11 +189,11 @@ impl<T: Send> Handle<T> {
     const TAG_INVALID: usize = 2;
 
     #[inline]
-    fn normalize(&self, scope: &Scope) {
-        let segments = self.global.segments.load(Ordering::Relaxed, scope);
+    fn normalize(&self, guard: &Guard) {
+        let segments = self.global.segments.load(Ordering::Relaxed, guard);
         let segments_ref = unsafe { segments.as_ref().unwrap() };
 
-        let tail = self.tail.load(Ordering::Relaxed, scope);
+        let tail = self.tail.load(Ordering::Relaxed, guard);
         let tail_ref = unsafe { tail.as_ref() };
 
         match tail_ref {
@@ -207,7 +207,7 @@ impl<T: Send> Handle<T> {
             }
         }
 
-        let head = self.head.load(Ordering::Relaxed, scope);
+        let head = self.head.load(Ordering::Relaxed, guard);
         let head_ref = unsafe { head.as_ref() };
 
         match head_ref {
@@ -223,18 +223,18 @@ impl<T: Send> Handle<T> {
     }
 
     #[inline]
-    fn find_cell<'scope>(
-        &'scope self,
-        segments: &'scope Atomic<Segment<T>>,
+    fn find_cell<'g>(
+        &'g self,
+        segments: &'g Atomic<Segment<T>>,
         cell_id: usize,
-        scope: &'scope Scope,
-    ) -> &'scope Cell<T> {
+        guard: &'g Guard,
+    ) -> &'g Cell<T> {
         let segment_id = cell_id / SEGMENT_SIZE;
 
-        let mut s = segments.load(Ordering::Relaxed, scope);
+        let mut s = segments.load(Ordering::Relaxed, guard);
         let mut s_ref = unsafe { s.as_ref().unwrap() };
         for id in 0..(segment_id - s_ref.id) {
-            let next = s_ref.next.load(Ordering::Relaxed, scope);
+            let next = s_ref.next.load(Ordering::Relaxed, guard);
             match unsafe { next.as_ref() } {
                 Some(next_ref) => {
                     s = next;
@@ -244,7 +244,7 @@ impl<T: Send> Handle<T> {
                     let segment = Owned::new(Segment::new(id + 1));
                     let _ = s_ref
                         .next
-                        .compare_and_set_owned(Ptr::null(), segment, Ordering::Relaxed, scope)
+                        .compare_and_set(Shared::null(), segment, Ordering::Relaxed, guard)
                         .map(|next| {
                             s = next;
                             s_ref = unsafe { next.as_ref().unwrap() };
@@ -276,9 +276,9 @@ impl<T: Send> Handle<T> {
     }
 
     #[inline]
-    fn try_to_claim_req<'scope>(
-        &'scope self,
-        state: &'scope State,
+    fn try_to_claim_req<'g>(
+        &'g self,
+        state: &'g State,
         cell_id: usize,
         i: usize,
     ) -> Result<(), (usize, bool)> {
@@ -294,67 +294,67 @@ impl<T: Send> Handle<T> {
     }
 
     #[inline]
-    fn push_commit<'scope>(&'scope self, c: &'scope Cell<T>, val: Ptr<'scope, T>, cell_id: usize) {
+    fn push_commit<'g>(&'g self, c: &'g Cell<T>, val: Shared<'g, T>, cell_id: usize) {
         Self::advance_end_for_linearizability(&self.global.tail, cell_id + 1);
         c.val.store(val, Ordering::Relaxed);
     }
 
     #[inline]
-    fn push_fast(&self, val: Owned<T>, scope: &Scope) -> Result<(), (Owned<T>, usize)> {
+    fn push_fast(&self, val: Owned<T>, guard: &Guard) -> Result<(), (Owned<T>, usize)> {
         let i = self.global.tail.fetch_add(1, Ordering::Relaxed);
-        let cell = self.find_cell(&self.tail, i, scope);
+        let cell = self.find_cell(&self.tail, i, guard);
         cell.val
-            .compare_and_set_owned(Ptr::null(), val, Ordering::Relaxed, scope)
+            .compare_and_set(Shared::null(), val, Ordering::Relaxed, guard)
             .map(|_| ())
             .map_err(|(_, val)| (val, i))
     }
 
     #[cold]
     #[inline]
-    fn push_slow(&self, val: Owned<T>, mut cell_id: usize, scope: &Scope) {
-        let req = &self.registry.get().push_req;
-        let val = val.into_ptr(scope);
-        req.val.store(val, Ordering::Relaxed);
-        req.state.store(cell_id, true, Ordering::Relaxed);
+    fn push_slow(&self, val: Owned<T>, mut cell_id: usize, guard: &Guard) {
+        let push = &self.registry.get().push;
+        let val = val.into_ptr(guard);
+        push.val.store(val, Ordering::Relaxed);
+        push.state.store(cell_id, true, Ordering::Relaxed);
 
-        let tail = self.tail.load(Ordering::Relaxed, scope);
+        let tail = self.tail.load(Ordering::Relaxed, guard);
         let original_tail = Atomic::null();
         original_tail.store(tail, Ordering::Relaxed);
 
         loop {
             let i = self.global.tail.fetch_add(1, Ordering::Relaxed);
-            let cell = self.find_cell(&original_tail, i, scope);
+            let cell = self.find_cell(&original_tail, i, guard);
             if cell.push
                 .compare_and_set(
-                    Ptr::null(),
-                    Ptr::from_raw(req as *const _),
+                    Shared::null(),
+                    Shared::from_raw(push as *const _),
                     Ordering::Relaxed,
-                    scope,
+                    guard,
                 )
-                .is_ok() && cell.val.load(Ordering::Relaxed, scope).is_null()
+                .is_ok() && cell.val.load(Ordering::Relaxed, guard).is_null()
             {
-                let _ = self.try_to_claim_req(&req.state, cell_id, i);
+                let _ = self.try_to_claim_req(&push.state, cell_id, i);
                 break;
             }
 
-            let (id, pending) = req.state.load(Ordering::Relaxed);
+            let (id, pending) = push.state.load(Ordering::Relaxed);
             cell_id = id;
             if !pending {
                 break;
             }
         }
 
-        let cell = self.find_cell(&self.tail, cell_id, scope);
+        let cell = self.find_cell(&self.tail, cell_id, guard);
         self.push_commit(cell, val, cell_id);
     }
 
-    pub fn push(&self, val: T, scope: &Scope) {
-        self.normalize(scope);
+    pub fn push(&self, val: T, guard: &Guard) {
+        self.normalize(guard);
 
         let mut val = Owned::new(val);
         let mut cell_id = 0;
         for _ in 0..Self::PATIENCE {
-            match self.push_fast(val, scope) {
+            match self.push_fast(val, guard) {
                 Ok(_) => return,
                 Err((v, id)) => {
                     val = v;
@@ -363,27 +363,27 @@ impl<T: Send> Handle<T> {
             }
         }
 
-        self.push_slow(val, cell_id, scope);
+        self.push_slow(val, cell_id, guard);
     }
 
-    pub fn try_pop(&self, scope: &Scope) -> Option<T> {
-        self.normalize(scope);
+    pub fn try_pop(&self, guard: &Guard) -> Option<T> {
+        self.normalize(guard);
 
         let mut cell_id = 0;
-        let result = self.try_pop_fast(&mut cell_id, scope)
-            .or_else(|| self.try_pop_slow(cell_id, scope));
+        let result = self.try_pop_fast(&mut cell_id, guard)
+            .or_else(|| self.try_pop_slow(cell_id, guard));
         if result.is_some() {
-            self.help_pop(scope);
+            self.help_pop(guard);
         }
         result.map(|result| result.into_inner())
     }
 
     #[inline]
-    fn try_pop_fast<'scope>(&'scope self, id: &'scope mut usize, scope: &'scope Scope) -> Option<Owned<T>> {
+    fn try_pop_fast<'g>(&'g self, id: &'g mut usize, guard: &'g Guard) -> Option<Owned<T>> {
         for _ in 0..Self::PATIENCE {
             let i = self.global.head.fetch_add(1, Ordering::Relaxed);
-            let cell = self.find_cell(&self.head, i, scope);
-            let result = self.help_push(cell, i, scope);
+            let cell = self.find_cell(&self.head, i, guard);
+            let result = self.help_push(cell, i, guard);
 
             match result.tag() {
                 Self::TAG_EMPTY => return None,
@@ -391,14 +391,14 @@ impl<T: Send> Handle<T> {
                 _ => {
                     if cell.pop
                         .compare_and_set(
-                            Ptr::null(),
-                            Ptr::null().with_tag(Self::TAG_INVALID),
+                            Shared::null(),
+                            Shared::null().with_tag(Self::TAG_INVALID),
                             Ordering::Relaxed,
-                            scope,
+                            guard,
                         )
                         .is_ok()
                     {
-                        return Some(unsafe { result.into_owned() });
+                        return Some(unsafe { result.into() });
                     } else {
                         *id = i;
                     }
@@ -409,67 +409,103 @@ impl<T: Send> Handle<T> {
     }
 
     #[inline]
-    fn try_pop_slow(&self, cell_id: usize, scope: &Scope) -> Option<Owned<T>> {
-        let req = &self.registry.get().pop_req;
+    fn try_pop_slow(&self, cell_id: usize, guard: &Guard) -> Option<Owned<T>> {
+        let req = &self.registry.get().pop;
         req.id.store(cell_id, Ordering::Relaxed);
         req.state.store(cell_id, true, Ordering::Relaxed);
 
-        self.help_pop(scope);
+        self.help_pop(guard);
 
         let i = req.state.load(Ordering::Relaxed).0;
-        let cell = self.find_cell(&self.head, i, scope);
+        let cell = self.find_cell(&self.head, i, guard);
         Self::advance_end_for_linearizability(&self.global.head, cell_id + 1);
 
-        let result = cell.val.load(Ordering::Relaxed, scope);
-        unsafe { result.as_ref().map(|_| result.into_owned()) }
+        let result = cell.val.load(Ordering::Relaxed, guard);
+        unsafe { result.as_ref().map(|_| result.into()) }
     }
 
-    fn help_push<'scope>(&'scope self, cell: &'scope Cell<T>, i: usize, scope: &'scope Scope) -> Ptr<'scope, T> {
-        let val = match cell.val.compare_and_set(
-            Ptr::null(),
-            Ptr::null().with_tag(Self::TAG_INVALID),
+    fn help_push<'g>(&'g self, cell: &'g Cell<T>, i: usize, guard: &'g Guard) -> Shared<'g, T> {
+        let cell_val = match cell.val.compare_and_set(
+            Shared::null(),
+            Shared::null().with_tag(Self::TAG_INVALID),
             Ordering::Relaxed,
-            scope,
+            guard,
         ) {
-            Ok(_) => Ptr::null().with_tag(Self::TAG_INVALID),
+            Ok(_) => Shared::null().with_tag(Self::TAG_INVALID),
             Err(val) => {
-                if val != Ptr::null().with_tag(Self::TAG_INVALID) {
+                if val != Shared::null().with_tag(Self::TAG_INVALID) {
                     return val;
                 }
                 val
             }
         };
 
-        let req = cell.push.load(Ordering::Relaxed, scope);
+        let push = &self.registry.get().push;
+        let (mut id, pending) = push.state.load(Ordering::Relaxed);
+        let mut cell_req = cell.push.load(Ordering::Relaxed, guard);
 
-        if req == Ptr::null() {
-            unimplemented!();
+        if cell_req == Shared::null() {
+            let (peer, peer_id, peer_pending) = loop {
+                let peer = self.registry.peer();
+                let (peer_id, peer_pending) = peer.push.state.load(Ordering::Relaxed);
+
+                if id == 0 || id == peer_id { break (peer, peer_id, peer_pending); }
+
+                push.state.store(0, pending, Ordering::Relaxed);
+                id = 0;
+                self.registry.next();
+            };
+
+            if peer_pending &&
+                peer_id <= i &&
+                cell.push.compare_and_set(
+                    Shared::null(),
+                    Shared::from_raw(&peer.push as *const _),
+                    Ordering::Relaxed,
+                    guard,
+                )
+                .is_err() {
+                push.state.store(peer_id, pending, Ordering::Relaxed);
+            } else {
+                self.registry.next();
+            }
+
+            cell_req = cell.push.load(Ordering::Relaxed, guard);
+            if cell_req == Shared::null() {
+                let _ = cell.push.compare_and_set(
+                    Shared::null(),
+                    Shared::null().with_tag(Self::TAG_INVALID),
+                    Ordering::Relaxed,
+                    guard,
+                );
+            }
         }
 
-        if req.tag() == Self::TAG_INVALID {
+        cell_req = cell.push.load(Ordering::Relaxed, guard);
+        if cell_req.tag() == Self::TAG_INVALID {
             let tail = self.global.tail.load(Ordering::Relaxed);
-            return Ptr::null().with_tag(if tail <= i { Self::TAG_EMPTY } else { Self::TAG_INVALID });
+            return Shared::null().with_tag(if tail <= i { Self::TAG_EMPTY } else { Self::TAG_INVALID });
         }
 
-        let req_ref = unsafe { req.as_ref().unwrap() };
-        let (id, pending) = req_ref.state.load(Ordering::Relaxed);
-        let v = req_ref.val.load(Ordering::Relaxed, scope);
+        let push_ref = unsafe { push.as_ref().unwrap() };
+        let (id, pending) = push_ref.state.load(Ordering::Relaxed);
+        let v = push_ref.val.load(Ordering::Relaxed, guard);
 
-        if id > i {
-            if val.tag() == Self::TAG_INVALID && self.global.tail.load(Ordering::Relaxed) <= i {
-                return Ptr::null().with_tag(Self::TAG_EMPTY);
+        if peer_id > i {
+            if cell_val.tag() == Self::TAG_INVALID && self.global.tail.load(Ordering::Relaxed) <= i {
+                return Shared::null().with_tag(Self::TAG_EMPTY);
             }
         } else {
-            if self.try_to_claim_req(&req_ref.state, id, i).is_ok() ||
-                ((id, pending) == (i, false) && val.tag() == Self::TAG_INVALID) {
+            if self.try_to_claim_req(&push_ref.state, peer_id, i).is_ok() ||
+                (peer_id == i && !peer_pending && cell_val.tag() == Self::TAG_INVALID) {
                 self.push_commit(cell, v, i);
             }
         }
-        val
+        cell_val
     }
 
     #[inline]
-    fn help_pop(&self, scope: &Scope) {
+    fn help_pop(&self, guard: &Guard) {
         unimplemented!()
     }
 }
@@ -477,7 +513,7 @@ impl<T: Send> Handle<T> {
 
 #[cfg(test)]
 mod tests {
-    use crossbeam_utils::scoped;
+    use crossbeam_utils::guardd;
     use epoch::Collector;
     use super::Queue;
 
@@ -491,12 +527,12 @@ mod tests {
 
         let threads = (0..THREADS)
             .map(|_| {
-                scoped::scope(|scope| {
-                    scope.spawn(|| {
+                scoped::scope(|guard| {
+                    guard.spawn(|| {
                         let handle = collector.handle();
                         let queue = queue.handle();
                         for _ in 0..COUNT {
-                            handle.pin(|scope| { queue.push(42, scope); });
+                            handle.pin(|guard| { queue.push(42, guard); });
                         }
                     })
                 })
