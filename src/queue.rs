@@ -513,7 +513,7 @@ impl<T: Send> Handle<T> {
 
 #[cfg(test)]
 mod tests {
-    use crossbeam_utils::guardd;
+    use crossbeam_utils::guard;
     use epoch::Collector;
     use super::Queue;
 

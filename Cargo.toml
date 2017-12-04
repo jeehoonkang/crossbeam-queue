@@ -10,5 +10,5 @@ documentation = "https://docs.rs/crossbeam-queue"
 description = "A Wait-free Queue as Fast as Fetch-and-Add"
 
 [dependencies]
-crossbeam-epoch = { git = "https://github.com/jeehoonkang/crossbeam-epoch.git", branch="pointer-trait" }
-crossbeam-utils = "0.1"
+crossbeam-epoch = { git = "https://github.com/jeehoonkang/crossbeam-epoch.git", branch="hazard-pointer" }
+crossbeam-utils = "0.2"

@@ -3,13 +3,12 @@
 //! Michael.  High Performance Dynamic Lock-Free Hash Tables and List-Based Sets.  SPAA 2002.
 //! http://dl.acm.org/citation.cfm?id=564870.564881
 
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use core::sync::atomic::Ordering;
 
-use epoch::{Atomic, Owned, Shared, Guard, unprotected};
 use crossbeam_utils::cache_padded::CachePadded;
+use epoch::{Atomic, Owned, Shared, Guard, Shield, unprotected};
 
-
-/// An entry in the linked list.
+#[derive(Debug)]
 struct NodeInner<T> {
     /// The data in the entry.
     data: T,
@@ -21,29 +20,35 @@ struct NodeInner<T> {
 
 unsafe impl<T> Send for NodeInner<T> {}
 
+/// A node in a linked list.
 #[derive(Debug)]
 pub struct Node<T>(CachePadded<NodeInner<T>>);
 
+/// A lock-free linked list of type `T`.
 #[derive(Debug)]
 pub struct List<T> {
+    /// The head of the linked list.
     head: Atomic<Node<T>>,
 }
 
-pub struct Iter<'g, T: 'g> {
-    /// The guard in which the iterator is operating.
-    guard: &'g Guard,
-
+/// An error that occurs during iteration over the list.
+pub struct Iter<T> {
     /// Pointer from the predecessor to the current entry.
-    pred: &'g Atomic<Node<T>>,
+    pred: Shield<Node<T>>,
 
     /// The current entry.
-    curr: Shared<'g, Node<T>>,
+    curr: Shield<Node<T>>,
+
+    /// The list head, needed for restarting iteration.
+    head: *const Atomic<Node<T>>,
 }
 
+/// An error that occurs during iteration over the list.
 #[derive(PartialEq, Debug)]
 pub enum IterError {
-    /// Iterator lost a race in deleting a node by a concurrent iterator.
-    LostRace,
+    /// A concurrent thread modified the state of the list at the same place that this iterator
+    /// was inspecting. Subsequent iteration will restart from the beginning of the list.
+    Stalled,
 }
 
 impl<T> Node<T> {
@@ -55,17 +60,13 @@ impl<T> Node<T> {
         }))
     }
 
-    pub fn get_data(&self) -> &T {
+    pub fn get(&self) -> &T {
         &self.0.data
-    }
-
-    pub fn get_next(&self) -> &Atomic<Node<T>> {
-        &self.0.next
     }
 
     /// Marks this entry as deleted.
     pub fn delete(&self, guard: &Guard) {
-        self.0.next.fetch_or(1, Release, guard);
+        self.0.next.fetch_or(1, Ordering::Release, guard);
     }
 }
 
@@ -75,66 +76,51 @@ impl<T> List<T> {
         List { head: Atomic::null() }
     }
 
+    /// Inserts `data` into the head of the list.
     #[inline]
-    pub fn get_head<'g>(&'g self, guard: &'g Guard) -> Shared<'g, Node<T>> {
-        self.head.load(Relaxed, guard)
-    }
-
-    /// Inserts `data` into the list.
-    #[inline]
-    fn insert_internal<'g>(
-        to: &'g Atomic<Node<T>>,
-        data: T,
-        guard: &'g Guard,
-    ) -> Shared<'g, Node<T>> {
-        let mut cur = Owned::new(Node::new(data));
-        let mut next = to.load(Relaxed, guard);
+    pub fn insert<'g>(&'g self, data: T, guard: &'g Guard) -> Shared<'g, Node<T>> {
+        // Insert right after head, i.e. at the beginning of the list.
+        let to = &self.head;
+        // Create a node containing `data`.
+        let node = Owned::new(Node::new(data)).into_shared(guard);
+        // Create a reference to the node.
+        let node_ref = unsafe { node.as_ref().unwrap() };
+        // Read the current successor of where we want to insert.
+        let mut next = to.load(Ordering::Relaxed, guard);
 
         loop {
-            cur.0.next.store(next, Relaxed);
-            match to.compare_and_set_weak(next, cur, Release, guard) {
-                Ok(cur) => return cur,
-                Err((n, c)) => {
-                    next = n;
-                    cur = c;
-                }
+            // Set the Entry of the to-be-inserted element to point to the previous successor of
+            // `to`.
+            node_ref.0.next.store(next, Ordering::Relaxed);
+            match to.compare_and_set_weak(next, node, Ordering::Release, guard) {
+                Ok(node) => return node,
+                // We lost the race or weak CAS failed spuriously. Update the successor and try
+                // again.
+                Err(err) => next = err.current,
             }
         }
     }
 
-    /// Inserts `data` into the head of the list.
-    #[inline]
-    pub fn insert<'g>(&'g self, data: T, guard: &'g Guard) -> Shared<'g, Node<T>> {
-        Self::insert_internal(&self.head, data, guard)
-    }
-
-    /// Inserts `data` after `after` into the list.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn insert_after<'g>(
-        &'g self,
-        after: &'g Atomic<Node<T>>,
-        data: T,
-        guard: &'g Guard,
-    ) -> Shared<'g, Node<T>> {
-        Self::insert_internal(after, data, guard)
-    }
-
-    /// Returns an iterator over all data.
+    /// Returns an iterator over all objects.
     ///
     /// # Caveat
     ///
-    /// Every datum that is inserted at the moment this function is called and persists at least
+    /// Every object that is inserted at the moment this function is called and persists at least
     /// until the end of iteration will be returned. Since this iterator traverses a lock-free
     /// linked list that may be concurrently modified, some additional caveats apply:
     ///
-    /// 1. If a new datum is inserted during iteration, it may or may not be returned.
-    /// 2. If a datum is deleted during iteration, it may or may not be returned.
-    /// 3. It may not return all data if a concurrent thread continues to iterate the same list.
-    pub fn iter<'g>(&'g self, guard: &'g Guard) -> Iter<'g, T> {
-        let pred = &self.head;
-        let curr = pred.load(Acquire, guard);
-        Iter { guard, pred, curr }
+    /// 1. If a new object is inserted during iteration, it may or may not be returned.
+    /// 2. If an object is deleted during iteration, it may or may not be returned.
+    /// 3. The iteration may be aborted when it lost in a race condition. In this case, the winning
+    ///    thread will continue to iterate over the same list.
+    pub fn iter(&self, guard: &Guard) -> Option<Iter<T>> {
+        let head = &self.head;
+        let curr = head.load(Ordering::Acquire, guard);
+        guard.shield(Shared::null()).and_then(|pred| {
+            guard.shield(curr).map(|curr| {
+                Iter { pred, curr, head }
+            })
+        })
     }
 }
 
@@ -142,62 +128,97 @@ impl<T> Drop for List<T> {
     fn drop(&mut self) {
         unsafe {
             let guard = unprotected();
-            let mut curr = self.head.load(Relaxed, guard);
+            let mut curr = self.head.load(Ordering::Relaxed, guard);
             while let Some(c) = curr.as_ref() {
-                let succ = c.0.next.load(Relaxed, guard);
-                drop(curr.into());
+                let succ = c.0.next.load(Ordering::Relaxed, guard);
+                drop(curr.into_owned());
                 curr = succ;
             }
         }
     }
 }
 
-impl<'g, T> Iterator for Iter<'g, T> {
-    type Item = Result<&'g Node<T>, IterError>;
+pub enum IterResult<'g, T: 'g> {
+    Some(&'g Node<T>),
+    None,
+    Restart,
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(c) = unsafe { self.curr.as_ref() } {
-            let succ = c.0.next.load(Acquire, self.guard);
+impl<T> Iter<T> {
+    pub fn get(&self) -> &Shield<Node<T>> {
+        &self.curr
+    }
+
+    #[inline]
+    fn restart<'g>(&'g self, guard: &'g Guard) -> IterResult<'g, T>
+    where
+        T: 'g,
+    {
+        self.pred.defend(Shared::null());
+        self.curr.defend(unsafe { &*self.head }.load(Ordering::Acquire, guard));
+        IterResult::Restart
+    }
+
+    pub fn next<'g>(&'g mut self, guard: &'g Guard) -> IterResult<'g, T>
+    where
+        T: 'g,
+    {
+        let pred = unsafe { self.pred.get().as_ref() }
+            .map(|pred| &pred.0.next)
+            .unwrap_or(unsafe { &*self.head });
+
+        // If `pred` is changed, restart from `head`.
+        if pred.load(Ordering::Relaxed, guard) != self.curr.get() {
+            return self.restart(guard);
+        }
+
+        while let Some(curr_ref) = unsafe { self.curr.get().as_ref() } {
+            let succ = curr_ref.0.next.load(Ordering::Acquire, guard);
 
             if succ.tag() == 1 {
-                // This entry was removed. Try unlinking it from the list.
+                // This node was removed. Try unlinking it from the list.
                 let succ = succ.with_tag(0);
 
-                match self.pred.compare_and_set_weak(
-                    self.curr,
+                // The tag should never be zero, because removing a node after a logically deleted
+                // node leaves the list in an invalid state.
+                debug_assert!(self.curr.get().tag() == 0);
+
+                match pred.compare_and_set(
+                    self.curr.get(),
                     succ,
-                    Acquire,
-                    self.guard,
+                    Ordering::Acquire,
+                    guard,
                 ) {
                     Ok(_) => {
+                        // We succeeded in unlinking this element from the list, so we have to
+                        // schedule deallocation. Deferred drop is okay, because `list.delete()`
+                        // can only be called if `T: 'static`.
                         unsafe {
-                            // Deferred drop of `T` is scheduled here.
-                            // This is okay because `.delete()` can be called only if `T: 'static`.
-                            let p = self.curr;
-                            self.guard.defer(move || p.into());
+                            let curr = self.curr.get();
+                            guard.defer(move |_| curr.into_owned());
                         }
-                        self.curr = succ;
+
+                        // Move over the removed by only advancing `curr`, not `pred`.
+                        self.curr.defend(succ);
+                        continue;
                     }
-                    Err((succ, _)) => {
-                        // We lost the race to delete the entry by a concurrent iterator. Set
-                        // `self.curr` to the updated pointer, and report the lost.
-                        self.curr = succ;
-                        return Some(Err(IterError::LostRace));
+                    Err(_) => {
+                        // A concurrent thread modified the predecessor node. Since it might've
+                        // been deleted, we need to restart from `head`.
+                        return self.restart(guard);
                     }
                 }
-
-                continue;
             }
 
             // Move one step forward.
-            self.pred = &c.0.next;
-            self.curr = succ;
+            self.pred.swap(&self.curr);
+            self.curr.defend(succ);
 
-            return Some(Ok(&c));
+            return IterResult::Some(curr_ref);
         }
 
         // We reached the end of the list.
-        None
+        IterResult::None
     }
 }
 
