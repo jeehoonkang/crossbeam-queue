@@ -1,22 +1,18 @@
 use std::fmt;
-use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use epoch;
 
-use list::{List, Node};
+use list::{List, Node, Iter, IterResult};
 
 pub struct Tracker<T: Sync> {
-    collector: epoch::Collector,
     list: Arc<List<T>>,
 }
 
 pub struct Handle<T: Sync> {
-    epoch: epoch::Guard,
-    list: Arc<List<T>>,
+    _list: Arc<List<T>>,
     node: *const Node<T>,
-    iter: Cell<*const Node<T>>,
+    iter: Iter<T>,
 }
 
 impl<T: Sync> fmt::Debug for Tracker<T> {
@@ -28,21 +24,16 @@ impl<T: Sync> fmt::Debug for Tracker<T> {
 impl<T: Sync> Tracker<T> {
     pub fn new() -> Self {
         Self {
-            collector: epoch::Collector::new(),
             list: Arc::new(List::new()),
         }
     }
 
-    pub fn handle(&self, data: T) -> Handle<T> {
-        let epoch = self.collector.guard();
-        let list = self.list.clone();
-        let node = unsafe { list.insert(data, &epoch).as_ref().unwrap() as *const _ };
-        Handle {
-            epoch,
-            list,
-            node,
-            iter: Cell::new(node),
-        }
+    pub fn handle(&self, data: T, guard: &epoch::Guard) -> Option<Handle<T>> {
+        let _list = self.list.clone();
+        let node = unsafe { _list.insert(data, guard).as_ref().unwrap() as *const _ };
+        _list.iter(guard).map(|iter| {
+            Handle { _list, node, iter }
+        })
     }
 }
 
@@ -55,25 +46,15 @@ impl<T: Sync> fmt::Debug for Handle<T> {
 
 impl<T: Sync> Handle<T> {
     pub fn get(&self) -> &T {
-        unsafe { (*self.node).get_data() }
+        unsafe { (*self.node).get() }
     }
 
-    pub fn peer(&self) -> &T {
-        unsafe { (*self.iter.get()).get_data() }
-    }
-
-    pub fn next(&self) {
-        unsafe {
-            let iter = self.iter.get();
-            let next = (*iter).get_next().load(Ordering::Relaxed, &self.epoch);
-            match next.as_ref() {
-                None => {
-                    self.epoch.safepoint();
-                    self.iter.set(self.list.get_head(&self.epoch).as_raw());
-                }
-                Some(next) => {
-                    self.iter.set(next);
-                }
+    pub fn next<'g>(&'g mut self, guard: &'g epoch::Guard) -> &'g T {
+        loop {
+            match self.iter.next(guard) {
+                IterResult::Some(result) => return unsafe { (*result).get() },
+                IterResult::None => self.iter.restart(guard),
+                IterResult::Restart => continue,
             }
         }
     }
@@ -82,7 +63,7 @@ impl<T: Sync> Handle<T> {
 impl<T: Sync> Drop for Handle<T> {
     fn drop(&mut self) {
         unsafe {
-            (*self.node).delete(&self.epoch);
+            (*self.node).delete(epoch::unprotected());
         }
     }
 }

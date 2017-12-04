@@ -43,14 +43,6 @@ pub struct Iter<T> {
     head: *const Atomic<Node<T>>,
 }
 
-/// An error that occurs during iteration over the list.
-#[derive(PartialEq, Debug)]
-pub enum IterError {
-    /// A concurrent thread modified the state of the list at the same place that this iterator
-    /// was inspecting. Subsequent iteration will restart from the beginning of the list.
-    Stalled,
-}
-
 impl<T> Node<T> {
     /// Returns the data in this entry.
     fn new(data: T) -> Self {
@@ -127,10 +119,9 @@ impl<T> List<T> {
 impl<T> Drop for List<T> {
     fn drop(&mut self) {
         unsafe {
-            let guard = unprotected();
-            let mut curr = self.head.load(Ordering::Relaxed, guard);
+            let mut curr = self.head.load(Ordering::Relaxed, unprotected());
             while let Some(c) = curr.as_ref() {
-                let succ = c.0.next.load(Ordering::Relaxed, guard);
+                let succ = c.0.next.load(Ordering::Relaxed, unprotected());
                 drop(curr.into_owned());
                 curr = succ;
             }
@@ -138,28 +129,43 @@ impl<T> Drop for List<T> {
     }
 }
 
-pub enum IterResult<'g, T: 'g> {
-    Some(&'g Node<T>),
+/// The result of an iteration.
+#[derive(Debug)]
+pub enum IterResult<T> {
+    Some(*const Node<T>),
     None,
+    /// A concurrent thread modified the state of the list at the same place that this iterator was
+    /// inspecting. Subsequent iteration will restart from the beginning of the list.
     Restart,
 }
 
-impl<T> Iter<T> {
-    pub fn get(&self) -> &Shield<Node<T>> {
-        &self.curr
+impl<T> IterResult<T> {
+    pub fn is_some(&self) -> bool {
+        match *self {
+            IterResult::Some(_) => true,
+            _ => false,
+        }
     }
 
+    pub fn is_none(&self) -> bool {
+        match *self {
+            IterResult::None => true,
+            _ => false,
+        }
+    }
+}
+
+impl<T> Iter<T> {
     #[inline]
-    fn restart<'g>(&'g self, guard: &'g Guard) -> IterResult<'g, T>
+    pub fn restart<'g>(&'g self, guard: &'g Guard)
     where
         T: 'g,
     {
         self.pred.defend(Shared::null());
         self.curr.defend(unsafe { &*self.head }.load(Ordering::Acquire, guard));
-        IterResult::Restart
     }
 
-    pub fn next<'g>(&'g mut self, guard: &'g Guard) -> IterResult<'g, T>
+    pub fn next<'g>(&'g mut self, guard: &'g Guard) -> IterResult<T>
     where
         T: 'g,
     {
@@ -169,7 +175,8 @@ impl<T> Iter<T> {
 
         // If `pred` is changed, restart from `head`.
         if pred.load(Ordering::Relaxed, guard) != self.curr.get() {
-            return self.restart(guard);
+            self.restart(guard);
+            return IterResult::Restart;
         }
 
         while let Some(curr_ref) = unsafe { self.curr.get().as_ref() } {
@@ -205,7 +212,8 @@ impl<T> Iter<T> {
                     Err(_) => {
                         // A concurrent thread modified the predecessor node. Since it might've
                         // been deleted, we need to restart from `head`.
-                        return self.restart(guard);
+                        self.restart(guard);
+                        return IterResult::Restart;
                     }
                 }
             }
@@ -239,25 +247,23 @@ mod tests {
 
         let collector = Collector::new();
         let handle = collector.handle();
+        let guard = handle.pin();
 
-        handle.pin(|guard| {
-            let p2 = l.insert(2, guard);
-            let n2 = unsafe { p2.as_ref().unwrap() };
-            let _p3 = l.insert_after(&n2.0.next, 3, guard);
-            let _p1 = l.insert(1, guard);
+        let _p3 = l.insert(3, &guard);
+        let p2 = l.insert(2, &guard);
+        let _p1 = l.insert(1, &guard);
 
-            let mut iter = l.iter(guard);
-            assert!(iter.next().is_some());
-            assert!(iter.next().is_some());
-            assert!(iter.next().is_some());
-            assert!(iter.next().is_none());
+        let mut iter = l.iter(&guard).unwrap();
+        assert!(iter.next(&guard).is_some());
+        assert!(iter.next(&guard).is_some());
+        assert!(iter.next(&guard).is_some());
+        assert!(iter.next(&guard).is_none());
 
-            n2.delete(guard);
+        unsafe { p2.as_ref().unwrap().delete(&guard); }
 
-            let mut iter = l.iter(guard);
-            assert!(iter.next().is_some());
-            assert!(iter.next().is_some());
-            assert!(iter.next().is_none());
-        });
+        let mut iter = l.iter(&guard).unwrap();
+        assert!(iter.next(&guard).is_some());
+        assert!(iter.next(&guard).is_some());
+        assert!(iter.next(&guard).is_none());
     }
 }

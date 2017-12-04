@@ -6,5 +6,5 @@ extern crate crossbeam_epoch as epoch;
 extern crate crossbeam_utils;
 
 pub mod list;
-// pub mod helpers;
+pub mod helpers;
 // pub mod queue;
