@@ -5,46 +5,46 @@ use epoch;
 
 use list::{List, Node, Iter, IterResult};
 
-pub struct Tracker<T: Sync> {
+pub struct Registry<T: Sync> {
     list: Arc<List<T>>,
 }
 
-pub struct Handle<T: Sync> {
+pub struct Participant<T: Sync> {
     _list: Arc<List<T>>,
     node: *const Node<T>,
     iter: Iter<T>,
 }
 
-impl<T: Sync> fmt::Debug for Tracker<T> {
+impl<T: Sync> fmt::Debug for Registry<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Tracker")
+        write!(f, "Registry")
     }
 }
 
-impl<T: Sync> Tracker<T> {
+impl<T: Sync> Registry<T> {
     pub fn new() -> Self {
         Self {
             list: Arc::new(List::new()),
         }
     }
 
-    pub fn handle(&self, data: T, guard: &epoch::Guard) -> Option<Handle<T>> {
+    pub fn participant(&self, data: T, guard: &epoch::Guard) -> Option<Participant<T>> {
         let _list = self.list.clone();
         let node = unsafe { _list.insert(data, guard).as_ref().unwrap() as *const _ };
         _list.iter(guard).map(|iter| {
-            Handle { _list, node, iter }
+            Participant { _list, node, iter }
         })
     }
 }
 
-impl<T: Sync> fmt::Debug for Handle<T> {
+impl<T: Sync> fmt::Debug for Participant<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Handle")
+        write!(f, "Participant")
     }
 }
 
 
-impl<T: Sync> Handle<T> {
+impl<T: Sync> Participant<T> {
     pub fn get(&self) -> &T {
         unsafe { (*self.node).get() }
     }
@@ -60,7 +60,7 @@ impl<T: Sync> Handle<T> {
     }
 }
 
-impl<T: Sync> Drop for Handle<T> {
+impl<T: Sync> Drop for Participant<T> {
     fn drop(&mut self) {
         unsafe {
             (*self.node).delete(epoch::unprotected());

@@ -5,6 +5,7 @@ extern crate core;
 extern crate crossbeam_epoch as epoch;
 extern crate crossbeam_utils;
 
+pub mod tagged_usize;
 pub mod list;
 pub mod helpers;
-// pub mod queue;
+pub mod queue;

@@ -1,81 +1,43 @@
 use std::fmt;
 use std::mem;
+use std::cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering;
-use epoch::{Atomic, Owned, Shared, Guard};
+use epoch::{Atomic, Owned, Shared, Guard, unprotected};
 
 use helpers;
+use tagged_usize::{TaggedUsize, AtomicTaggedUsize};
 
+/// FIXME
 const SEGMENT_SIZE: usize = 64;
 
-#[derive(Debug, Default)]
-struct State(AtomicUsize);
-
-impl State {
-    fn encode(data: usize, bit: bool) -> usize {
-        (data << 1) + (if bit { 1 } else { 0 })
-    }
-
-    fn decode(val: usize) -> (usize, bool) {
-        (val >> 1, (val & 1) == 1)
-    }
-
-    #[inline]
-    pub fn load(&self, ordering: Ordering) -> (usize, bool) {
-        Self::decode(self.0.load(ordering))
-    }
-
-    #[inline]
-    pub fn store(&self, data: usize, bit: bool, ordering: Ordering) {
-        self.0.store(Self::encode(data, bit), ordering)
-    }
-
-    #[inline]
-    pub fn compare_exchange(
-        &self,
-        data1: usize,
-        bit1: bool,
-        data2: usize,
-        bit2: bool,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<(), (usize, bool)> {
-        self.0
-            .compare_exchange(
-                Self::encode(data1, bit1),
-                Self::encode(data2, bit2),
-                success,
-                failure,
-            )
-            .map(|_| ())
-            .map_err(|old| Self::decode(old))
-    }
-}
-
+/// FIXME
 #[derive(Debug)]
 struct PushReq<T: Send> {
     val: Atomic<T>,
-    state: State,
+    state: AtomicTaggedUsize,
 }
 
 unsafe impl<T: Send> Sync for PushReq<T> {}
 
+/// FIXME
 #[derive(Debug, Default)]
 struct PopReq {
     id: AtomicUsize,
-    state: State,
+    state: AtomicTaggedUsize,
 }
 
 unsafe impl Sync for PopReq {}
 
+/// FIXME
 #[derive(Debug)]
-struct Registry<T: Send> {
+struct Local<T: Send> {
     push: PushReq<T>,
     pop: PopReq,
-    lower_bound: AtomicUsize,
 }
 
+/// FIXME
 #[derive(Debug)]
 struct Cell<T: Send> {
     val: Atomic<T>,
@@ -93,6 +55,7 @@ impl<T: Send> Default for Cell<T> {
     }
 }
 
+/// FIXME
 struct Segment<T: Send> {
     id: usize,
     cells: [Cell<T>; SEGMENT_SIZE],
@@ -100,7 +63,9 @@ struct Segment<T: Send> {
 }
 
 impl<T: Send> Segment<T> {
+    /// FIXME
     fn new(id: usize) -> Self {
+        // FIXME: mem::uninitialized() is okay.
         let mut result = Self {
             id: id,
             cells: unsafe { mem::uninitialized() },
@@ -115,44 +80,51 @@ impl<T: Send> Segment<T> {
 
 impl<T: Send> fmt::Debug for Segment<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // FIXME: using library?
         write!(f, "Segment {{ id: {} }}", self.id)
     }
 }
 
+/// FIXME
 #[derive(Debug)]
 struct Global<T: Send> {
     segments: Atomic<Segment<T>>,
     head: AtomicUsize,
     tail: AtomicUsize,
-    registries: helpers::Tracker<Registry<T>>,
+    registry: helpers::Registry<Local<T>>,
 }
 
+/// FIXME
 #[derive(Debug)]
-pub struct Queue<T: Send>(Arc<Global<T>>);
+pub struct Queue<T: Send> {
+    global: Arc<Global<T>>,
+}
 
+/// FIXME
 #[derive(Debug)]
 pub struct Handle<T: Send> {
     global: Arc<Global<T>>,
+    participant: helpers::Participant<Local<T>>,
     head: Atomic<Segment<T>>,
     tail: Atomic<Segment<T>>,
-    registry: helpers::Handle<Registry<T>>,
+    head_id: cell::Cell<usize>,
+    tail_id: cell::Cell<usize>,
 }
 
 impl<T: Send> Default for PushReq<T> {
     fn default() -> Self {
         Self {
             val: Atomic::null(),
-            state: State::default(),
+            state: AtomicTaggedUsize::default(),
         }
     }
 }
 
-impl<T: Send> Default for Registry<T> {
+impl<T: Send> Default for Local<T> {
     fn default() -> Self {
         Self {
             push: PushReq::default(),
             pop: PopReq::default(),
-            lower_bound: ATOMIC_USIZE_INIT,
         }
     }
 }
@@ -163,30 +135,167 @@ impl<T: Send> Global<T> {
             segments: Atomic::new(Segment::new(0)),
             head: ATOMIC_USIZE_INIT,
             tail: ATOMIC_USIZE_INIT,
-            registries: helpers::Tracker::new(),
+            registry: helpers::Registry::new(),
         }
     }
 }
 
 impl<T: Send> Queue<T> {
+    /// FIXME
     pub fn new() -> Self {
-        Self { 0: Arc::new(Global::new()) }
+        Self { global: Arc::new(Global::new()) }
     }
 
-    pub fn handle(&self) -> Handle<T> {
-        Handle {
-            global: self.0.clone(),
-            head: Atomic::null(),
-            tail: Atomic::null(),
-            registry: self.0.registries.handle(Registry::default()),
-        }
+    /// FIXME
+    pub fn handle(&self) -> Option<Handle<T>> {
+        Handle::create(self.global.clone())
     }
 }
 
 impl<T: Send> Handle<T> {
+    /// FIXME
     const PATIENCE: usize = 10;
+    /// FIXME
     const TAG_EMPTY: usize = 1;
+    /// FIXME
     const TAG_INVALID: usize = 2;
+
+    /// FIXME
+    #[inline]
+    fn create(global: Arc<Global<T>>) -> Option<Self> {
+        global.registry.participant(Local::default(), unprotected()).map(|participant| {
+            Self {
+                global: global,
+                participant,
+                head: Atomic::null(),
+                tail: Atomic::null(),
+                head_id: cell::Cell::new(0),
+                tail_id: cell::Cell::new(0),
+            }
+        })
+    }
+
+    /// FIXME
+    pub fn clone(&self) -> Option<Self> {
+        Self::create(self.global.clone())
+    }
+
+    /// FIXME
+    #[inline]
+    fn find_cell<'g>(
+        &'g self,
+        segments: &'g Atomic<Segment<T>>,
+        cell_id: usize,
+        guard: &'g Guard,
+    ) -> &'g Cell<T> {
+        let segment_id = cell_id / SEGMENT_SIZE;
+
+        let mut s = segments.load(Ordering::Relaxed, guard); // FIXME
+        let mut s_ref = unsafe { s.as_ref().unwrap() };
+        for id in s_ref.id..segment_id {
+            debug_assert_eq!(id, s_ref.id, "segments should be linearly aligned.");
+
+            let next = s_ref.next.load(Ordering::Relaxed, guard);
+            match unsafe { next.as_ref() } {
+                Some(next_ref) => {
+                    s = next;
+                    s_ref = next_ref;
+                }
+                None => {
+                    let new = Owned::new(Segment::new(id + 1));
+                    s = s_ref.next
+                        .compare_and_set(Shared::null(), new, Ordering::Relaxed, guard) // FIXME
+                        .unwrap_or_else(|e| e.current);
+                    s_ref = unsafe { s.as_ref().unwrap() };
+                }
+            }
+        }
+
+        segments.store(s, Ordering::Relaxed); // FIXME
+        &s_ref.cells[cell_id % SEGMENT_SIZE]
+    }
+
+    /// FIXME
+    #[inline]
+    fn advance_end_for_linearizability(end: &AtomicUsize, cell_id: usize) {
+        let mut e = end.load(Ordering::Relaxed);
+        while e < cell_id {
+            match end.compare_exchange(e, cell_id, Ordering::Relaxed, Ordering::Relaxed) { // FIXME
+                Ok(_) => break,
+                Err(current) => e = current,
+            }
+        }
+    }
+
+    // FIXME(jeehoonkang): REVISED SO FAR
+
+    /// FIXME
+    pub fn push(&self, val: T, guard: &Guard) {
+        self.normalize(guard);
+
+        let mut val = Owned::new(val);
+        let mut cell_id = 0;
+        for _ in 0..Self::PATIENCE {
+            match self.push_fast(val, guard) {
+                Ok(_) => return,
+                Err((v, id)) => {
+                    val = v;
+                    cell_id = id;
+                }
+            }
+        }
+
+        self.push_slow(val, cell_id, guard);
+    }
+
+    #[inline]
+    fn push_fast(&self, val: Owned<T>, guard: &Guard) -> Result<(), (Owned<T>, usize)> {
+        let i = self.global.tail.fetch_add(1, Ordering::Relaxed);
+        let cell = self.find_cell(&self.tail, i, guard);
+        cell.val
+            .compare_and_set(Shared::null(), val, Ordering::Relaxed, guard)
+            .map(|_| ())
+            .map_err(|e| (e.new, i))
+    }
+
+    #[cold]
+    #[inline]
+    fn push_slow(&self, val: Owned<T>, mut cell_id: usize, guard: &Guard) {
+        let push = &self.participant.get().push;
+        let val = val.into_shared(guard);
+        push.val.store(val, Ordering::Relaxed);
+        push.state.store(TaggedUsize::new(cell_id, true), Ordering::Relaxed);
+
+        let tail = self.tail.load(Ordering::Relaxed, guard);
+        let original_tail = Atomic::null();
+        original_tail.store(tail, Ordering::Relaxed);
+
+        loop {
+            let i = self.global.tail.fetch_add(1, Ordering::Relaxed);
+            let cell = self.find_cell(&original_tail, i, guard);
+            if cell.push
+                .compare_and_set(
+                    Shared::null(),
+                    Shared::from(push as *const _),
+                    Ordering::Relaxed,
+                    guard,
+                )
+                .is_ok() && cell.val.load(Ordering::Relaxed, guard).is_null()
+            {
+                let _ = self.try_to_claim_req(&push.state, cell_id, i);
+                break;
+            }
+
+            let (id, pending) = push.state.load(Ordering::Relaxed);
+            cell_id = id;
+            if !pending {
+                break;
+            }
+        }
+
+        let cell = self.find_cell(&self.tail, cell_id, guard);
+        self.push_commit(cell, val, cell_id);
+    }
 
     #[inline]
     fn normalize(&self, guard: &Guard) {
@@ -223,72 +332,16 @@ impl<T: Send> Handle<T> {
     }
 
     #[inline]
-    fn find_cell<'g>(
-        &'g self,
-        segments: &'g Atomic<Segment<T>>,
-        cell_id: usize,
-        guard: &'g Guard,
-    ) -> &'g Cell<T> {
-        let segment_id = cell_id / SEGMENT_SIZE;
-
-        let mut s = segments.load(Ordering::Relaxed, guard);
-        let mut s_ref = unsafe { s.as_ref().unwrap() };
-        for id in 0..(segment_id - s_ref.id) {
-            let next = s_ref.next.load(Ordering::Relaxed, guard);
-            match unsafe { next.as_ref() } {
-                Some(next_ref) => {
-                    s = next;
-                    s_ref = next_ref;
-                }
-                None => {
-                    let segment = Owned::new(Segment::new(id + 1));
-                    let _ = s_ref
-                        .next
-                        .compare_and_set(Shared::null(), segment, Ordering::Relaxed, guard)
-                        .map(|next| {
-                            s = next;
-                            s_ref = unsafe { next.as_ref().unwrap() };
-                        })
-                        .map_err(|(next, _)| {
-                            s = next;
-                            s_ref = unsafe { next.as_ref().unwrap() };
-                        });
-                }
-            }
-        }
-
-        segments.store(s, Ordering::Relaxed);
-        &s_ref.cells[cell_id % SEGMENT_SIZE]
-    }
-
-    #[inline]
-    fn advance_end_for_linearizability(end: &AtomicUsize, cell_id: usize) {
-        let mut e = end.load(Ordering::Relaxed);
-        loop {
-            if e >= cell_id {
-                break;
-            }
-            match end.compare_exchange(e, cell_id, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(e2) => e = e2,
-            }
-        }
-    }
-
-    #[inline]
     fn try_to_claim_req<'g>(
         &'g self,
-        state: &'g State,
+        state: &'g AtomicTaggedUsize,
         cell_id: usize,
         i: usize,
     ) -> Result<(), (usize, bool)> {
         // This should be a strong update.
-        state.compare_exchange(
-            cell_id,
-            true,
-            i,
-            false,
-            Ordering::Relaxed,
+        state.compare_and_set(
+            TaggedUsize::new(cell_id, true),
+            TaggedUsize::new(i, false),
             Ordering::Relaxed,
         )
     }
@@ -297,73 +350,6 @@ impl<T: Send> Handle<T> {
     fn push_commit<'g>(&'g self, c: &'g Cell<T>, val: Shared<'g, T>, cell_id: usize) {
         Self::advance_end_for_linearizability(&self.global.tail, cell_id + 1);
         c.val.store(val, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn push_fast(&self, val: Owned<T>, guard: &Guard) -> Result<(), (Owned<T>, usize)> {
-        let i = self.global.tail.fetch_add(1, Ordering::Relaxed);
-        let cell = self.find_cell(&self.tail, i, guard);
-        cell.val
-            .compare_and_set(Shared::null(), val, Ordering::Relaxed, guard)
-            .map(|_| ())
-            .map_err(|(_, val)| (val, i))
-    }
-
-    #[cold]
-    #[inline]
-    fn push_slow(&self, val: Owned<T>, mut cell_id: usize, guard: &Guard) {
-        let push = &self.registry.get().push;
-        let val = val.into_ptr(guard);
-        push.val.store(val, Ordering::Relaxed);
-        push.state.store(cell_id, true, Ordering::Relaxed);
-
-        let tail = self.tail.load(Ordering::Relaxed, guard);
-        let original_tail = Atomic::null();
-        original_tail.store(tail, Ordering::Relaxed);
-
-        loop {
-            let i = self.global.tail.fetch_add(1, Ordering::Relaxed);
-            let cell = self.find_cell(&original_tail, i, guard);
-            if cell.push
-                .compare_and_set(
-                    Shared::null(),
-                    Shared::from_raw(push as *const _),
-                    Ordering::Relaxed,
-                    guard,
-                )
-                .is_ok() && cell.val.load(Ordering::Relaxed, guard).is_null()
-            {
-                let _ = self.try_to_claim_req(&push.state, cell_id, i);
-                break;
-            }
-
-            let (id, pending) = push.state.load(Ordering::Relaxed);
-            cell_id = id;
-            if !pending {
-                break;
-            }
-        }
-
-        let cell = self.find_cell(&self.tail, cell_id, guard);
-        self.push_commit(cell, val, cell_id);
-    }
-
-    pub fn push(&self, val: T, guard: &Guard) {
-        self.normalize(guard);
-
-        let mut val = Owned::new(val);
-        let mut cell_id = 0;
-        for _ in 0..Self::PATIENCE {
-            match self.push_fast(val, guard) {
-                Ok(_) => return,
-                Err((v, id)) => {
-                    val = v;
-                    cell_id = id;
-                }
-            }
-        }
-
-        self.push_slow(val, cell_id, guard);
     }
 
     pub fn try_pop(&self, guard: &Guard) -> Option<T> {
@@ -375,7 +361,7 @@ impl<T: Send> Handle<T> {
         if result.is_some() {
             self.help_pop(guard);
         }
-        result.map(|result| result.into_inner())
+        result.map(|result| result.into_box().into())
     }
 
     #[inline]
@@ -410,9 +396,9 @@ impl<T: Send> Handle<T> {
 
     #[inline]
     fn try_pop_slow(&self, cell_id: usize, guard: &Guard) -> Option<Owned<T>> {
-        let req = &self.registry.get().pop;
+        let req = &self.participant.get().pop;
         req.id.store(cell_id, Ordering::Relaxed);
-        req.state.store(cell_id, true, Ordering::Relaxed);
+        req.state.store(TaggedUsize::new(cell_id, true), Ordering::Relaxed);
 
         self.help_pop(guard);
 
@@ -421,7 +407,7 @@ impl<T: Send> Handle<T> {
         Self::advance_end_for_linearizability(&self.global.head, cell_id + 1);
 
         let result = cell.val.load(Ordering::Relaxed, guard);
-        unsafe { result.as_ref().map(|_| result.into()) }
+        unsafe { result.as_ref().map(|_| result.into_owned()) }
     }
 
     fn help_push<'g>(&'g self, cell: &'g Cell<T>, i: usize, guard: &'g Guard) -> Shared<'g, T> {
@@ -432,7 +418,8 @@ impl<T: Send> Handle<T> {
             guard,
         ) {
             Ok(_) => Shared::null().with_tag(Self::TAG_INVALID),
-            Err(val) => {
+            Err(e) => {
+                let val = e.current;
                 if val != Shared::null().with_tag(Self::TAG_INVALID) {
                     return val;
                 }
@@ -440,34 +427,34 @@ impl<T: Send> Handle<T> {
             }
         };
 
-        let push = &self.registry.get().push;
+        let push = &self.participant.get().push;
         let (mut id, pending) = push.state.load(Ordering::Relaxed);
         let mut cell_req = cell.push.load(Ordering::Relaxed, guard);
 
         if cell_req == Shared::null() {
             let (peer, peer_id, peer_pending) = loop {
-                let peer = self.registry.peer();
+                let peer = self.participant.peer();
                 let (peer_id, peer_pending) = peer.push.state.load(Ordering::Relaxed);
 
                 if id == 0 || id == peer_id { break (peer, peer_id, peer_pending); }
 
-                push.state.store(0, pending, Ordering::Relaxed);
+                push.state.store(TaggedUsize::new(0, pending), Ordering::Relaxed);
                 id = 0;
-                self.registry.next();
+                self.participant.next();
             };
 
             if peer_pending &&
                 peer_id <= i &&
                 cell.push.compare_and_set(
                     Shared::null(),
-                    Shared::from_raw(&peer.push as *const _),
+                    Shared::from(&peer.push as *const _),
                     Ordering::Relaxed,
                     guard,
                 )
                 .is_err() {
-                push.state.store(peer_id, pending, Ordering::Relaxed);
+                push.state.store(TaggedUsize::new(peer_id, pending), Ordering::Relaxed);
             } else {
-                self.registry.next();
+                self.participant.next();
             }
 
             cell_req = cell.push.load(Ordering::Relaxed, guard);
@@ -487,16 +474,15 @@ impl<T: Send> Handle<T> {
             return Shared::null().with_tag(if tail <= i { Self::TAG_EMPTY } else { Self::TAG_INVALID });
         }
 
-        let push_ref = unsafe { push.as_ref().unwrap() };
-        let (id, pending) = push_ref.state.load(Ordering::Relaxed);
-        let v = push_ref.val.load(Ordering::Relaxed, guard);
+        let (id, pending) = push.state.load(Ordering::Relaxed);
+        let v = push.val.load(Ordering::Relaxed, guard);
 
         if peer_id > i {
             if cell_val.tag() == Self::TAG_INVALID && self.global.tail.load(Ordering::Relaxed) <= i {
                 return Shared::null().with_tag(Self::TAG_EMPTY);
             }
         } else {
-            if self.try_to_claim_req(&push_ref.state, peer_id, i).is_ok() ||
+            if self.try_to_claim_req(&push.state, peer_id, i).is_ok() ||
                 (peer_id == i && !peer_pending && cell_val.tag() == Self::TAG_INVALID) {
                 self.push_commit(cell, v, i);
             }
