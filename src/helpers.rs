@@ -49,10 +49,14 @@ impl<T: Sync> Participant<T> {
         unsafe { (*self.node).get() }
     }
 
-    pub fn next<'g>(&'g mut self, guard: &'g epoch::Guard) -> &'g T {
+    pub fn peer<'g>(&'g self) -> &'g T {
+        unsafe { self.iter.get().as_ref().unwrap().get() }
+    }
+
+    pub fn next<'g>(&'g self, guard: &'g epoch::Guard) {
         loop {
             match self.iter.next(guard) {
-                IterResult::Some(result) => return unsafe { (*result).get() },
+                IterResult::Some => return,
                 IterResult::None => self.iter.restart(guard),
                 IterResult::Restart => continue,
             }

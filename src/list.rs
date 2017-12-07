@@ -131,18 +131,18 @@ impl<T> Drop for List<T> {
 
 /// The result of an iteration.
 #[derive(Debug)]
-pub enum IterResult<T> {
-    Some(*const Node<T>),
+pub enum IterResult {
+    Some,
     None,
     /// A concurrent thread modified the state of the list at the same place that this iterator was
     /// inspecting. Subsequent iteration will restart from the beginning of the list.
     Restart,
 }
 
-impl<T> IterResult<T> {
+impl IterResult {
     pub fn is_some(&self) -> bool {
         match *self {
-            IterResult::Some(_) => true,
+            IterResult::Some => true,
             _ => false,
         }
     }
@@ -165,7 +165,15 @@ impl<T> Iter<T> {
         self.curr.defend(unsafe { &*self.head }.load(Ordering::Acquire, guard));
     }
 
-    pub fn next<'g>(&'g mut self, guard: &'g Guard) -> IterResult<T>
+    #[inline]
+    pub fn get<'g>(&'g self) -> Shared<'g, Node<T>>
+        where
+        T: 'g,
+    {
+        self.curr.get()
+    }
+
+    pub fn next<'g>(&'g self, guard: &'g Guard) -> IterResult
     where
         T: 'g,
     {
@@ -222,7 +230,7 @@ impl<T> Iter<T> {
             self.pred.swap(&self.curr);
             self.curr.defend(succ);
 
-            return IterResult::Some(curr_ref);
+            return IterResult::Some;
         }
 
         // We reached the end of the list.
