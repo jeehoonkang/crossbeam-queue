@@ -27,6 +27,12 @@ impl TaggedUsize {
         Self::default()
     }
 
+    /// FIXME
+    #[inline]
+    pub fn decompose(self) -> (usize, bool) {
+        (self.data >> 1, (self.data & 1) != 0)
+    }
+
     /// Returns the number of epochs `self` is ahead of `rhs`.
     ///
     /// Internally, epochs are represented as numbers in the range `(isize::MIN / 2) .. (isize::MAX
@@ -100,8 +106,12 @@ impl AtomicTaggedUsize {
     ///
     /// The `Ordering` argument describes the memory ordering of this operation.
     #[inline]
-    pub fn compare_and_swap(&self, current: TaggedUsize, new: TaggedUsize, ord: Ordering) -> TaggedUsize {
-        let data = self.data.compare_and_swap(current.data, new.data, ord);
-        TaggedUsize { data }
+    pub fn compare_and_set(&self,
+                           current: TaggedUsize, new: TaggedUsize,
+                           ord_success: Ordering, ord_failure: Ordering)
+                           -> Result<TaggedUsize, TaggedUsize> {
+        self.data.compare_exchange(current.data, new.data, ord_success, ord_failure)
+            .map(|data| TaggedUsize { data })
+            .map_err(|data| TaggedUsize { data })
     }
 }

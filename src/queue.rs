@@ -107,6 +107,7 @@ pub struct Handle<T: Send> {
     participant: helpers::Participant<Local<T>>,
     head: Atomic<Segment<T>>,
     tail: Atomic<Segment<T>>,
+    // FIXME(jeehoonkang): is ids can wrap around, thus accessing freed memory..
     head_id: cell::Cell<usize>,
     tail_id: cell::Cell<usize>,
 }
@@ -163,16 +164,18 @@ impl<T: Send> Handle<T> {
     /// FIXME
     #[inline]
     fn create(global: Arc<Global<T>>) -> Option<Self> {
-        global.registry.participant(Local::default(), unprotected()).map(|participant| {
-            Self {
-                global: global,
-                participant,
-                head: Atomic::null(),
-                tail: Atomic::null(),
-                head_id: cell::Cell::new(0),
-                tail_id: cell::Cell::new(0),
-            }
-        })
+        unsafe {
+            global.registry.participant(Local::default(), unprotected()).map(|participant| {
+                Self {
+                    global: global,
+                    participant,
+                    head: Atomic::null(),
+                    tail: Atomic::null(),
+                    head_id: cell::Cell::new(-1isize as usize),
+                    tail_id: cell::Cell::new(-1isize as usize),
+                }
+            })
+        }
     }
 
     /// FIXME
@@ -227,6 +230,23 @@ impl<T: Send> Handle<T> {
         }
     }
 
+    /// FIXME: update head/tail if they are stale (more so than global.segments).
+    #[inline]
+    fn normalize(&self, guard: &Guard) {
+        let segments = self.global.segments.load(Ordering::Relaxed, guard);
+        let segments_ref = unsafe { segments.as_ref().unwrap() };
+
+        if (self.head_id.get().wrapping_sub(segments_ref.id) as isize) < 0 {
+            self.head.store(segments, Ordering::Relaxed);
+            self.head_id.set(segments_ref.id);
+        }
+
+        if (self.tail_id.get().wrapping_sub(segments_ref.id) as isize) < 0 {
+            self.tail.store(segments, Ordering::Relaxed);
+            self.tail_id.set(segments_ref.id);
+        }
+    }
+
     // FIXME(jeehoonkang): REVISED SO FAR
 
     /// FIXME
@@ -236,12 +256,9 @@ impl<T: Send> Handle<T> {
         let mut val = Owned::new(val);
         let mut cell_id = 0;
         for _ in 0..Self::PATIENCE {
-            match self.push_fast(val, guard) {
+            match self.push_fast(val, &mut cell_id, guard) {
                 Ok(_) => return,
-                Err((v, id)) => {
-                    val = v;
-                    cell_id = id;
-                }
+                Err(v) => val = v,
             }
         }
 
@@ -249,13 +266,16 @@ impl<T: Send> Handle<T> {
     }
 
     #[inline]
-    fn push_fast(&self, val: Owned<T>, guard: &Guard) -> Result<(), (Owned<T>, usize)> {
+    fn push_fast(&self, val: Owned<T>, cell_id: &mut usize, guard: &Guard) -> Result<(), Owned<T>> {
         let i = self.global.tail.fetch_add(1, Ordering::Relaxed);
         let cell = self.find_cell(&self.tail, i, guard);
         cell.val
             .compare_and_set(Shared::null(), val, Ordering::Relaxed, guard)
             .map(|_| ())
-            .map_err(|e| (e.new, i))
+            .map_err(|e| {
+                *cell_id = i;
+                e.new
+            })
     }
 
     #[cold]
@@ -286,7 +306,7 @@ impl<T: Send> Handle<T> {
                 break;
             }
 
-            let (id, pending) = push.state.load(Ordering::Relaxed);
+            let (id, pending) = push.state.load(Ordering::Relaxed).decompose();
             cell_id = id;
             if !pending {
                 break;
@@ -295,40 +315,6 @@ impl<T: Send> Handle<T> {
 
         let cell = self.find_cell(&self.tail, cell_id, guard);
         self.push_commit(cell, val, cell_id);
-    }
-
-    #[inline]
-    fn normalize(&self, guard: &Guard) {
-        let segments = self.global.segments.load(Ordering::Relaxed, guard);
-        let segments_ref = unsafe { segments.as_ref().unwrap() };
-
-        let tail = self.tail.load(Ordering::Relaxed, guard);
-        let tail_ref = unsafe { tail.as_ref() };
-
-        match tail_ref {
-            None => {
-                self.tail.store(segments, Ordering::Relaxed);
-            }
-            Some(tail_ref) => {
-                if tail_ref.id < segments_ref.id {
-                    self.tail.store(segments, Ordering::Relaxed);
-                }
-            }
-        }
-
-        let head = self.head.load(Ordering::Relaxed, guard);
-        let head_ref = unsafe { head.as_ref() };
-
-        match head_ref {
-            None => {
-                self.head.store(segments, Ordering::Relaxed);
-            }
-            Some(head_ref) => {
-                if head_ref.id < segments_ref.id {
-                    self.head.store(segments, Ordering::Relaxed);
-                }
-            }
-        }
     }
 
     #[inline]
@@ -343,7 +329,10 @@ impl<T: Send> Handle<T> {
             TaggedUsize::new(cell_id, true),
             TaggedUsize::new(i, false),
             Ordering::Relaxed,
+            Ordering::Relaxed,
         )
+            .map(|_| ())
+            .map_err(|current| current.decompose())
     }
 
     #[inline]
@@ -352,16 +341,16 @@ impl<T: Send> Handle<T> {
         c.val.store(val, Ordering::Relaxed);
     }
 
-    pub fn try_pop(&self, guard: &Guard) -> Option<T> {
+    pub fn try_pop(&self, guard: &Guard) -> Option<Box<T>> {
         self.normalize(guard);
 
         let mut cell_id = 0;
         let result = self.try_pop_fast(&mut cell_id, guard)
             .or_else(|| self.try_pop_slow(cell_id, guard));
-        if result.is_some() {
+        result.map(|result| {
             self.help_pop(guard);
-        }
-        result.map(|result| result.into_box().into())
+            result.into_box().into()
+        })
     }
 
     #[inline]
@@ -384,7 +373,7 @@ impl<T: Send> Handle<T> {
                         )
                         .is_ok()
                     {
-                        return Some(unsafe { result.into() });
+                        return Some(unsafe { result.into_owned() });
                     } else {
                         *id = i;
                     }
@@ -402,7 +391,7 @@ impl<T: Send> Handle<T> {
 
         self.help_pop(guard);
 
-        let i = req.state.load(Ordering::Relaxed).0;
+        let (i, _) = req.state.load(Ordering::Relaxed).decompose();
         let cell = self.find_cell(&self.head, i, guard);
         Self::advance_end_for_linearizability(&self.global.head, cell_id + 1);
 
@@ -411,83 +400,84 @@ impl<T: Send> Handle<T> {
     }
 
     fn help_push<'g>(&'g self, cell: &'g Cell<T>, i: usize, guard: &'g Guard) -> Shared<'g, T> {
-        let cell_val = match cell.val.compare_and_set(
-            Shared::null(),
-            Shared::null().with_tag(Self::TAG_INVALID),
-            Ordering::Relaxed,
-            guard,
-        ) {
-            Ok(_) => Shared::null().with_tag(Self::TAG_INVALID),
-            Err(e) => {
-                let val = e.current;
-                if val != Shared::null().with_tag(Self::TAG_INVALID) {
-                    return val;
-                }
-                val
-            }
-        };
+        unimplemented!()
+        // let cell_val = match cell.val.compare_and_set(
+        //     Shared::null(),
+        //     Shared::null().with_tag(Self::TAG_INVALID),
+        //     Ordering::Relaxed,
+        //     guard,
+        // ) {
+        //     Ok(_) => Shared::null().with_tag(Self::TAG_INVALID),
+        //     Err(e) => {
+        //         let val = e.current;
+        //         if val != Shared::null().with_tag(Self::TAG_INVALID) {
+        //             return val;
+        //         }
+        //         val
+        //     }
+        // };
 
-        let push = &self.participant.get().push;
-        let (mut id, pending) = push.state.load(Ordering::Relaxed);
-        let mut cell_req = cell.push.load(Ordering::Relaxed, guard);
+        // let push = &self.participant.get().push;
+        // let (mut id, pending) = push.state.load(Ordering::Relaxed);
+        // let mut cell_req = cell.push.load(Ordering::Relaxed, guard);
 
-        if cell_req == Shared::null() {
-            let (peer, peer_id, peer_pending) = loop {
-                let peer = self.participant.peer();
-                let (peer_id, peer_pending) = peer.push.state.load(Ordering::Relaxed);
+        // if cell_req == Shared::null() {
+        //     let (peer, peer_id, peer_pending) = loop {
+        //         let peer = self.participant.peer();
+        //         let (peer_id, peer_pending) = peer.push.state.load(Ordering::Relaxed);
 
-                if id == 0 || id == peer_id { break (peer, peer_id, peer_pending); }
+        //         if id == 0 || id == peer_id { break (peer, peer_id, peer_pending); }
 
-                push.state.store(TaggedUsize::new(0, pending), Ordering::Relaxed);
-                id = 0;
-                self.participant.next();
-            };
+        //         push.state.store(TaggedUsize::new(0, pending), Ordering::Relaxed);
+        //         id = 0;
+        //         self.participant.next();
+        //     };
 
-            if peer_pending &&
-                peer_id <= i &&
-                cell.push.compare_and_set(
-                    Shared::null(),
-                    Shared::from(&peer.push as *const _),
-                    Ordering::Relaxed,
-                    guard,
-                )
-                .is_err() {
-                push.state.store(TaggedUsize::new(peer_id, pending), Ordering::Relaxed);
-            } else {
-                self.participant.next();
-            }
+        //     if peer_pending &&
+        //         peer_id <= i &&
+        //         cell.push.compare_and_set(
+        //             Shared::null(),
+        //             Shared::from(&peer.push as *const _),
+        //             Ordering::Relaxed,
+        //             guard,
+        //         )
+        //         .is_err() {
+        //         push.state.store(TaggedUsize::new(peer_id, pending), Ordering::Relaxed);
+        //     } else {
+        //         self.participant.next();
+        //     }
 
-            cell_req = cell.push.load(Ordering::Relaxed, guard);
-            if cell_req == Shared::null() {
-                let _ = cell.push.compare_and_set(
-                    Shared::null(),
-                    Shared::null().with_tag(Self::TAG_INVALID),
-                    Ordering::Relaxed,
-                    guard,
-                );
-            }
-        }
+        //     cell_req = cell.push.load(Ordering::Relaxed, guard);
+        //     if cell_req == Shared::null() {
+        //         let _ = cell.push.compare_and_set(
+        //             Shared::null(),
+        //             Shared::null().with_tag(Self::TAG_INVALID),
+        //             Ordering::Relaxed,
+        //             guard,
+        //         );
+        //     }
+        // }
 
-        cell_req = cell.push.load(Ordering::Relaxed, guard);
-        if cell_req.tag() == Self::TAG_INVALID {
-            let tail = self.global.tail.load(Ordering::Relaxed);
-            return Shared::null().with_tag(if tail <= i { Self::TAG_EMPTY } else { Self::TAG_INVALID });
-        }
+        // cell_req = cell.push.load(Ordering::Relaxed, guard);
+        // if cell_req.tag() == Self::TAG_INVALID {
+        //     let tail = self.global.tail.load(Ordering::Relaxed);
+        //     return Shared::null().with_tag(if tail <= i { Self::TAG_EMPTY } else { Self::TAG_INVALID });
+        // }
 
-        let (id, pending) = push.state.load(Ordering::Relaxed);
-        let v = push.val.load(Ordering::Relaxed, guard);
+        // let (id, pending) = push.state.load(Ordering::Relaxed);
+        // let v = push.val.load(Ordering::Relaxed, guard);
 
-        if peer_id > i {
-            if cell_val.tag() == Self::TAG_INVALID && self.global.tail.load(Ordering::Relaxed) <= i {
-                return Shared::null().with_tag(Self::TAG_EMPTY);
-            }
-        } else {
-            if self.try_to_claim_req(&push.state, peer_id, i).is_ok() ||
-                (peer_id == i && !peer_pending && cell_val.tag() == Self::TAG_INVALID) {
-                self.push_commit(cell, v, i);
-            }
-        }
-        cell_val
+        // if peer_id > i {
+        //     if cell_val.tag() == Self::TAG_INVALID && self.global.tail.load(Ordering::Relaxed) <= i {
+        //         return Shared::null().with_tag(Self::TAG_EMPTY);
+        //     }
+        // } else {
+        //     if self.try_to_claim_req(&push.state, peer_id, i).is_ok() ||
+        //         (peer_id == i && !peer_pending && cell_val.tag() == Self::TAG_INVALID) {
+        //         self.push_commit(cell, v, i);
+        //     }
+        // }
+        // cell_val
     }
 
     #[inline]
