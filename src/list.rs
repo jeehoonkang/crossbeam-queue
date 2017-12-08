@@ -261,7 +261,7 @@ mod tests {
         let p2 = l.insert(2, &guard);
         let _p1 = l.insert(1, &guard);
 
-        let mut iter = l.iter(&guard).unwrap();
+        let iter = l.iter(&guard).unwrap();
         assert!(iter.next(&guard).is_some());
         assert!(iter.next(&guard).is_some());
         assert!(iter.next(&guard).is_some());
@@ -269,7 +269,7 @@ mod tests {
 
         unsafe { p2.as_ref().unwrap().delete(&guard); }
 
-        let mut iter = l.iter(&guard).unwrap();
+        let iter = l.iter(&guard).unwrap();
         assert!(iter.next(&guard).is_some());
         assert!(iter.next(&guard).is_some());
         assert!(iter.next(&guard).is_none());

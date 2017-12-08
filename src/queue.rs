@@ -252,32 +252,27 @@ impl<T: Send> Handle<T> {
     /// FIXME
     pub fn push(&self, val: T, guard: &Guard) {
         self.normalize(guard);
-
-        let mut val = Owned::new(val);
-        let mut cell_id = 0;
-        for _ in 0..Self::PATIENCE {
-            match self.push_fast(val, &mut cell_id, guard) {
-                Ok(_) => return,
-                Err(v) => val = v,
-            }
-        }
-
-        self.push_slow(val, cell_id, guard);
+        self.push_fast(Owned::new(val), guard)
+            .unwrap_or_else(|(val, cell_id)| self.push_slow(val, cell_id, guard))
     }
 
     /// FIXME
     #[inline]
-    fn push_fast(&self, val: Owned<T>, cell_id: &mut usize, guard: &Guard) -> Result<(), Owned<T>> {
-        let i = self.global.tail.fetch_add(1, Ordering::Relaxed); // FIXME
-        let cell = self.find_cell(&self.tail, i, guard);
-        self.tail_id.set(i / SEGMENT_SIZE);
-        cell.val
-            .compare_and_set(Shared::null(), val, Ordering::Relaxed, guard) // FIXME
-            .map(|_| ())
-            .map_err(|e| {
-                *cell_id = i;
-                e.new
-            })
+    fn push_fast(&self, mut val: Owned<T>, guard: &Guard) -> Result<(), (Owned<T>, usize)> {
+        let mut cell_id = 0;
+        for _ in 0..Self::PATIENCE {
+            let i = self.global.tail.fetch_add(1, Ordering::Relaxed); // FIXME
+            let cell = self.find_cell(&self.tail, i, guard);
+            self.tail_id.set(i / SEGMENT_SIZE);
+            match cell.val.compare_and_set(Shared::null(), val, Ordering::Relaxed, guard) { // FIXME
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    cell_id = i;
+                    val = e.new;
+                }
+            }
+        }
+        Err((val, cell_id))
     }
 
     /// FIXME
@@ -344,31 +339,29 @@ impl<T: Send> Handle<T> {
     /// FIXME
     pub fn try_pop(&self, guard: &Guard) -> Option<T> {
         self.normalize(guard);
-
-        let mut cell_id = 0;
-        let result = self.try_pop_fast(&mut cell_id, guard)
-            .or_else(|| self.try_pop_slow(cell_id, guard));
-        result.map(|result| {
-            self.help_pop(guard);
-            self.participant.next(guard);
-            *result.into_box()
-        })
+        self.try_pop_fast(guard)
+            .or_else(|cell_id| self.try_pop_slow(cell_id, guard).ok_or(()))
+            .ok()
+            .map(|result| {
+                self.help_pop(self.participant.peer(), guard);
+                self.participant.next(guard);
+                *result.into_box()
+            })
     }
-
-    // FIXME(jeehoonkang): REVISED SO FAR
 
     /// FIXME
     #[inline]
-    fn try_pop_fast<'g>(&'g self, id: &'g mut usize, guard: &'g Guard) -> Option<Owned<T>> {
+    fn try_pop_fast<'g>(&'g self, guard: &'g Guard) -> Result<Owned<T>, usize> {
+        let mut id = 0;
         for _ in 0..Self::PATIENCE {
-            let i = self.global.head.fetch_add(1, Ordering::Relaxed);
+            let i = self.global.head.fetch_add(1, Ordering::Relaxed); // FIXME
             let cell = self.find_cell(&self.head, i, guard);
             self.head_id.set(i / SEGMENT_SIZE);
             let result = self.help_push(cell, i, guard);
 
             match result.tag() {
-                Self::TAG_EMPTY => return None,
-                Self::TAG_INVALID => *id = i,
+                Self::TAG_EMPTY => return Err(id),
+                Self::TAG_INVALID => id = i,
                 _ => {
                     if cell.pop
                         .compare_and_set(
@@ -376,17 +369,16 @@ impl<T: Send> Handle<T> {
                             Shared::null().with_tag(Self::TAG_INVALID),
                             Ordering::Relaxed,
                             guard,
-                        )
+                        ) // FIXME
                         .is_ok()
                     {
-                        return Some(unsafe { result.into_owned() });
-                    } else {
-                        *id = i;
+                        return Ok(unsafe { result.into_owned() });
                     }
+                    id = i;
                 }
             }
         }
-        None
+        Err(id)
     }
 
     /// FIXME
@@ -396,7 +388,7 @@ impl<T: Send> Handle<T> {
         req.id.store(cell_id, Ordering::Relaxed);
         req.state.store(TaggedUsize::new(cell_id, true), Ordering::Relaxed);
 
-        self.help_pop(guard);
+        self.help_pop(self.participant.get(), guard); // FIXME: designating helpee?
 
         let (i, _) = req.state.load(Ordering::Relaxed).decompose();
         let cell = self.find_cell(&self.head, i, guard);
@@ -405,93 +397,92 @@ impl<T: Send> Handle<T> {
 
         let result = cell.val.load(Ordering::Relaxed, guard);
         unsafe { result.as_ref().map(|_| result.into_owned()) }
+        // FIXME: do we need ManuallyDrop?
     }
 
     /// FIXME
     fn help_push<'g>(&'g self, cell: &'g Cell<T>, i: usize, guard: &'g Guard) -> Shared<'g, T> {
-        unimplemented!()
-        // let cell_val = match cell.val.compare_and_set(
-        //     Shared::null(),
-        //     Shared::null().with_tag(Self::TAG_INVALID),
-        //     Ordering::Relaxed,
-        //     guard,
-        // ) {
-        //     Ok(_) => Shared::null().with_tag(Self::TAG_INVALID),
-        //     Err(e) => {
-        //         let val = e.current;
-        //         if val != Shared::null().with_tag(Self::TAG_INVALID) {
-        //             return val;
-        //         }
-        //         val
-        //     }
-        // };
+        match cell.val.compare_and_set(
+            Shared::null(),
+            Shared::null().with_tag(Self::TAG_INVALID),
+            Ordering::Relaxed, // FIXME
+            guard,
+        ) {
+            Ok(_) => {},
+            Err(e) => {
+                let val = e.current;
+                if val != Shared::null().with_tag(Self::TAG_INVALID) { return val; }
+            }
+        };
 
-        // let push = &self.participant.get().push;
-        // let (mut id, pending) = push.state.load(Ordering::Relaxed);
-        // let mut cell_req = cell.push.load(Ordering::Relaxed, guard);
+        // cell.val is INVALID, so help slow-path pushes
+        let push = &self.participant.get().push;
+        let (mut id, pending) = push.state.load(Ordering::Relaxed).decompose(); // FIXME
 
-        // if cell_req == Shared::null() {
-        //     let (peer, peer_id, peer_pending) = loop {
-        //         let peer = self.participant.peer();
-        //         let (peer_id, peer_pending) = peer.push.state.load(Ordering::Relaxed);
+        let mut cell_push = cell.push.load(Ordering::Relaxed, guard); // FIXME
+        if cell_push == Shared::null() {
+            let (peer, peer_id, peer_pending) = loop {
+                let peer = self.participant.peer();
+                let (peer_id, peer_pending) = peer.push.state.load(Ordering::Relaxed).decompose(); // FIXME
 
-        //         if id == 0 || id == peer_id { break (peer, peer_id, peer_pending); }
+                if id == 0 || id == peer_id { break (peer, peer_id, peer_pending); }
+                // (peer, peer_id, peer_pending); } FIXME
 
-        //         push.state.store(TaggedUsize::new(0, pending), Ordering::Relaxed);
-        //         id = 0;
-        //         self.participant.next();
-        //     };
+                push.state.store(TaggedUsize::new(0, pending), Ordering::Relaxed);
+                id = 0;
+                self.participant.next(guard);
+            };
 
-        //     if peer_pending &&
-        //         peer_id <= i &&
-        //         cell.push.compare_and_set(
-        //             Shared::null(),
-        //             Shared::from(&peer.push as *const _),
-        //             Ordering::Relaxed,
-        //             guard,
-        //         )
-        //         .is_err() {
-        //         push.state.store(TaggedUsize::new(peer_id, pending), Ordering::Relaxed);
-        //     } else {
-        //         self.participant.next();
-        //     }
+            if peer_pending && peer_id <= i &&
+                cell.push.compare_and_set(
+                    Shared::null(),
+                    Shared::from(&peer.push as *const _),
+                    Ordering::Relaxed, // FIXME
+                    guard,
+                ).is_err() {
+                push.state.store(TaggedUsize::new(peer_id, pending), Ordering::Relaxed); // FIXME
+            } else {
+                self.participant.next(guard);
+            }
 
-        //     cell_req = cell.push.load(Ordering::Relaxed, guard);
-        //     if cell_req == Shared::null() {
-        //         let _ = cell.push.compare_and_set(
-        //             Shared::null(),
-        //             Shared::null().with_tag(Self::TAG_INVALID),
-        //             Ordering::Relaxed,
-        //             guard,
-        //         );
-        //     }
-        // }
+            // FIXME: read cell.push first?
+            let _ = cell.push.compare_and_set(
+                Shared::null(),
+                Shared::null().with_tag(Self::TAG_INVALID),
+                Ordering::Relaxed, // FIXME
+                guard,
+            );
+        }
 
-        // cell_req = cell.push.load(Ordering::Relaxed, guard);
-        // if cell_req.tag() == Self::TAG_INVALID {
-        //     let tail = self.global.tail.load(Ordering::Relaxed);
-        //     return Shared::null().with_tag(if tail <= i { Self::TAG_EMPTY } else { Self::TAG_INVALID });
-        // }
+        cell_push = cell.push.load(Ordering::Relaxed, guard); // FIXME
+        if cell_push.tag() == Self::TAG_INVALID {
+            let tail = self.global.tail.load(Ordering::Relaxed); // FIXME
+            return Shared::null().with_tag(if tail <= i { Self::TAG_EMPTY } else { Self::TAG_INVALID });
+        }
 
-        // let (id, pending) = push.state.load(Ordering::Relaxed);
-        // let v = push.val.load(Ordering::Relaxed, guard);
+        let cell_push_ref = unsafe { cell_push.as_ref().unwrap() };
+        let (cell_id, cell_pending) = cell_push_ref.state.load(Ordering::Relaxed).decompose(); // FIXME
+        let cell_val = cell.val.load(Ordering::Relaxed, guard); // FIXME
 
-        // if peer_id > i {
-        //     if cell_val.tag() == Self::TAG_INVALID && self.global.tail.load(Ordering::Relaxed) <= i {
-        //         return Shared::null().with_tag(Self::TAG_EMPTY);
-        //     }
-        // } else {
-        //     if self.try_to_claim_req(&push.state, peer_id, i).is_ok() ||
-        //         (peer_id == i && !peer_pending && cell_val.tag() == Self::TAG_INVALID) {
-        //         self.push_commit(cell, v, i);
-        //     }
-        // }
-        // cell_val
+        if cell_id > i {
+            if cell_val.tag() == Self::TAG_INVALID && self.global.tail.load(Ordering::Relaxed) <= i { // FIXME
+                return Shared::null().with_tag(Self::TAG_EMPTY);
+            }
+        } else {
+            if Self::try_to_claim_req(&cell_push_ref.state, cell_id, i).is_ok() || (cell_id == i && !cell_pending && cell_val.tag() == Self::TAG_INVALID) {
+                let val = cell_push_ref.val.load(Ordering::Relaxed, guard); // FIXME
+                self.push_commit(cell, val, i);
+            }
+        }
+
+        cell_val
     }
+
+    // FIXME(jeehoonkang): REVISED SO FAR
 
     /// FIXME
     #[inline]
-    fn help_pop(&self, guard: &Guard) {
+    fn help_pop(&self, helpee: &Local<T>, guard: &Guard) {
         unimplemented!()
     }
 }
@@ -499,7 +490,7 @@ impl<T: Send> Handle<T> {
 
 #[cfg(test)]
 mod tests {
-    use crossbeam_utils::guard;
+    use crossbeam_utils::scoped;
     use epoch::Collector;
     use super::Queue;
 
@@ -513,12 +504,13 @@ mod tests {
 
         let threads = (0..THREADS)
             .map(|_| {
-                scoped::scope(|guard| {
-                    guard.spawn(|| {
-                        let handle = collector.handle();
-                        let queue = queue.handle();
+                scoped::scope(|scope| {
+                    scope.spawn(|| {
+                        let collector_handle = collector.handle();
+                        let queue_handle = queue.handle().unwrap();
                         for _ in 0..COUNT {
-                            handle.pin(|guard| { queue.push(42, guard); });
+                            let guard = collector_handle.pin();
+                            queue_handle.push(42, &guard);
                         }
                     })
                 })
